@@ -7,11 +7,6 @@ from redzone_engine import RZOpportunityEngine
 
 class DKSimulatorDataPipeline:
     def __init__(self, stats_season, target_season, target_week, dk_salary_csv=None):
-        """
-        stats_season:  year to pull historical stats from (e.g. 2025)
-        target_season: year of the slate you're building (e.g. 2026)
-        target_week:   week of the slate (e.g. 1)
-        """
         self.stats_season = stats_season
         self.target_season = target_season
         self.week = target_week
@@ -48,11 +43,8 @@ class DKSimulatorDataPipeline:
         print("[Engine] Calculating market consensus field ownership curves...")
 
         if dataframe is None or dataframe.empty:
-            print("[Warning] Ownership model received an empty dataframe. Skipping.")
             return dataframe
-
         if 'position' not in dataframe.columns or 'salary' not in dataframe.columns:
-            print("[Warning] Missing 'position' or 'salary'. Assigning flat 5% ownership.")
             dataframe['Ownership'] = 0.05
             return dataframe
 
@@ -60,38 +52,36 @@ class DKSimulatorDataPipeline:
         df['salary'] = pd.to_numeric(df['salary'], errors='coerce').fillna(0)
         df = df[df['salary'] > 0].copy()
         if df.empty:
-            print("[Warning] All salaries were zero. Assigning flat 5% ownership.")
             dataframe['Ownership'] = 0.05
             return dataframe
 
-        df['value_metric'] = (df['gpp_projection'] / df['salary']) * 1000
-        df['raw_bias'] = df['value_metric'].clip(lower=0) ** 1.85
+        # Value metric blends median projection and ceiling. Tournament fields
+        # reward ceiling, but ownership still tracks value per dollar.
+        df['value_metric'] = ((df['gpp_projection'] * 0.65 + df['ceiling_projection'] * 0.35) / df['salary']) * 1000
 
         pos_scales = {'QB': 0.12, 'RB': 0.28, 'WR': 0.45, 'TE': 0.15}
-        final_ownership_list = []
+        pieces = []
 
         for pos, weight in pos_scales.items():
             pos_df = df[df['position'] == pos].copy()
             if pos_df.empty:
-                print(f"[Warning] No players at position {pos}; skipping.")
                 continue
 
-            total_bias = pos_df['raw_bias'].sum()
-            if total_bias > 0:
-                pos_df['Ownership'] = (pos_df['raw_bias'] / total_bias) * weight
-            else:
-                pos_df['Ownership'] = weight / len(pos_df)
+            pos_df['value_rank'] = pos_df['value_metric'].rank(ascending=False, method='min')
+            decay = 0.85 ** (pos_df['value_rank'] - 1)
+            pos_df['Ownership'] = (decay / decay.sum()) * weight
 
-            max_cap = 0.48 if pos in ['RB', 'WR'] else 0.28
-            pos_df['Ownership'] = pos_df['Ownership'].clip(lower=0.01, upper=max_cap)
-            final_ownership_list.append(pos_df)
+            max_cap = 0.45 if pos in ['RB', 'WR'] else 0.25
+            pos_df['Ownership'] = pos_df['Ownership'].clip(lower=0.005, upper=max_cap)
+            pieces.append(pos_df)
 
-        if not final_ownership_list:
-            print("[Warning] Ownership produced no rows. Falling back to flat 5%.")
+        if not pieces:
             dataframe['Ownership'] = 0.05
             return dataframe
 
-        return pd.concat(final_ownership_list, ignore_index=True)
+        result = pd.concat(pieces, ignore_index=True)
+        print(f"[Engine] Ownership range: {result['Ownership'].min():.4f}–{result['Ownership'].max():.4f}")
+        return result
 
     def run_gpp_optimized_pipeline(self, injuries=None):
         base_projections = self.base_pipeline.run_full_pipeline(injured_players_dict=injuries)
@@ -122,23 +112,46 @@ class DKSimulatorDataPipeline:
         final_df = pd.merge(final_df, variance_matrix, on='player_id', how='left')
         final_df['historical_std'] = final_df['historical_std'].fillna(7.5)
 
+        # --- Touchdown equity applies to BOTH median and ceiling ---
         def apply_touchdown_equity(row):
             current_projection = row['final_projection']
+            current_ceiling    = row['ceiling_projection']
             if row['position'] == 'RB' and row['rz_carry_share'] >= 0.40:
-                return current_projection * 1.12
+                return current_projection * 1.12, current_ceiling * 1.15
             if row['position'] in ['WR', 'TE'] and row['rz_target_share'] >= 0.25:
-                return current_projection * 1.08
-            return current_projection
+                return current_projection * 1.08, current_ceiling * 1.12
+            return current_projection, current_ceiling
 
-        final_df['gpp_projection'] = final_df.apply(apply_touchdown_equity, axis=1).round(2)
+        touched = final_df.apply(apply_touchdown_equity, axis=1, result_type='expand')
+        final_df['gpp_projection']   = touched[0].round(2)
+        final_df['ceiling_projection'] = touched[1].round(2)
+
+        # --- Ceiling-to-median ratio flags tournament leverage plays ---
+        # A high ratio means the median is low but the ceiling is high — exactly
+        # the players you want in a GPP but that the field under-rosters.
+        final_df['ceiling_ratio'] = (final_df['ceiling_projection'] / final_df['gpp_projection'].replace(0, np.nan)).round(3)
+        final_df['ceiling_ratio'] = final_df['ceiling_ratio'].fillna(1.0)
+
         final_df = self.model_algorithmic_ownership(final_df)
 
         if final_df is None or final_df.empty:
             raise RuntimeError("Ownership model returned an empty dataframe.")
 
+        # --- Leverage score: high ceiling vs. low ownership = tournament gold ---
+        final_df['leverage_score'] = (
+            (final_df['ceiling_projection'] / final_df['ceiling_projection'].max())
+            / final_df['Ownership'].replace(0, np.nan)
+        ).round(3)
+        final_df['leverage_score'] = final_df['leverage_score'].fillna(0)
+
         sim_input_cols = {
             'player_name': 'Player', 'position': 'Position', 'recent_team': 'Team',
             'opponent_team': 'Opponent', 'gpp_projection': 'Projection',
+            'ceiling_projection': 'Ceiling',
+            'ceiling_multiplier': 'Ceiling_Mult',
+            'usage_stability': 'Usage_Stability',
+            'ceiling_ratio': 'Ceiling_Ratio',
+            'leverage_score': 'Leverage',
             'historical_std': 'StdDev', 'salary': 'Salary', 'Ownership': 'Ownership'
         }
 
@@ -147,8 +160,12 @@ class DKSimulatorDataPipeline:
             columns={k: v for k, v in sim_input_cols.items() if k in available_keys}
         )
 
-        sim_export['Ownership'] = sim_export['Ownership'].round(4)
-        sim_export['StdDev'] = sim_export['StdDev'].round(2)
+        for col in ['Ownership', 'Leverage']:
+            if col in sim_export.columns:
+                sim_export[col] = sim_export[col].round(4)
+        if 'StdDev' in sim_export.columns:
+            sim_export['StdDev'] = sim_export['StdDev'].round(2)
+
         sim_export = sim_export.sort_values(by='Projection', ascending=False)
 
         csv_sim_filename = f"sim_input_projections_{self.target_season}_w{self.week}.csv"

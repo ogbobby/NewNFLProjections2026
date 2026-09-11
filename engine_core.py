@@ -5,12 +5,13 @@ import nflreadpy
 
 class DKCoreDataEngine:
     def __init__(self, stats_season, target_season, target_week):
-        self.stats_season = stats_season      # year to pull historical stats from
-        self.target_season = target_season    # year of the slate you're building
-        self.week = target_week               # week of the slate
+        self.stats_season = stats_season
+        self.target_season = target_season
+        self.week = target_week
         self.POSITION_WINDOWS = {'QB': 6, 'RB': 6, 'WR': 3, 'TE': 3}
         self.master_weekly = None
         self.schedule = None
+        self.dk_salary_csv = None
         self._loaded = False
 
     def fetch_and_clean_data(self):
@@ -30,7 +31,7 @@ class DKCoreDataEngine:
         df = self.master_weekly
         df = df[df['position'].isin(['QB', 'RB', 'WR', 'TE'])].copy()
 
-        # --- Use full display name so joins against DK work ---
+        # --- Full display name for joins against DK ---
         if 'player_display_name' in df.columns:
             df['player_name'] = df['player_display_name']
         elif 'full_name' in df.columns:
@@ -47,8 +48,8 @@ class DKCoreDataEngine:
         df = df.rename(columns={k: v for k, v in rename_map.items()
                                 if k in df.columns and v not in df.columns})
 
-        # --- Safe numeric fallbacks ---
-        for col in ['pass_attempts', 'rush_attempts', 'receptions',
+        # --- Numeric fallbacks (includes targets now) ---
+        for col in ['pass_attempts', 'rush_attempts', 'receptions', 'targets',
                     'passing_yards', 'passing_tds', 'passing_interceptions',
                     'rushing_yards', 'rushing_tds',
                     'receiving_yards', 'receiving_tds',
@@ -57,10 +58,11 @@ class DKCoreDataEngine:
                 df[col] = 0.0
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
 
-        # --- Team denominators for shares ---
+        # --- Team denominators ---
         df['team_pass_attempts'] = df.groupby(['team', 'week'])['pass_attempts'].transform('sum').replace(0, np.nan)
         df['team_rush_attempts'] = df.groupby(['team', 'week'])['rush_attempts'].transform('sum').replace(0, np.nan)
         df['team_receptions']    = df.groupby(['team', 'week'])['receptions'].transform('sum').replace(0, np.nan)
+        df['team_targets']       = df.groupby(['team', 'week'])['targets'].transform('sum').replace(0, np.nan)
 
         # --- DK scoring ---
         pass_pts = df['passing_yards'] * 0.04 + df['passing_tds'] * 4.0 - df['passing_interceptions'] * 1.0
@@ -87,7 +89,6 @@ class DKCoreDataEngine:
     def project_macro_team_volume(self):
         print("[Core] Extracting Vegas totals and playbook profiles...")
 
-        # --- Try the schedule for the target season/week ---
         sched = self.schedule.copy() if self.schedule is not None else pd.DataFrame()
         if not sched.empty and 'week' in sched.columns:
             sched = sched[sched['week'] == self.week].copy()
@@ -110,22 +111,23 @@ class DKCoreDataEngine:
                 vegas_rows.append({'team': away, 'opponent_team': home,
                                    'implied_total': away_implied, 'is_fav': spread > 0})
         else:
-            # --- Fallback: read matchups from the DK salary file's Game Info ---
-            if getattr(self, 'dk_salary_csv', None) and pd.io.common.file_exists(self.dk_salary_csv):
-                dk = pd.read_csv(self.dk_salary_csv)
-                if 'Game Info' in dk.columns and 'TeamAbbrev' in dk.columns:
-                    matchups = dk[['Game Info', 'TeamAbbrev']].drop_duplicates()
-                    for _, r in matchups.iterrows():
-                        game = r['Game Info'].split(' ')[0]
-                        if '@' in game:
-                            away, home = game.split('@')
-                            vegas_rows.append({'team': home, 'opponent_team': away,
-                                               'implied_total': 22.0, 'is_fav': False})
-                            vegas_rows.append({'team': away, 'opponent_team': home,
-                                               'implied_total': 22.0, 'is_fav': False})
-                    # Dedupe by team
-                    if vegas_rows:
-                        vegas_rows = pd.DataFrame(vegas_rows).drop_duplicates('team').to_dict('records')
+            if getattr(self, 'dk_salary_csv', None):
+                try:
+                    dk = pd.read_csv(self.dk_salary_csv)
+                    if 'Game Info' in dk.columns:
+                        matchups = dk['Game Info'].drop_duplicates()
+                        for info in matchups:
+                            game = str(info).split(' ')[0]
+                            if '@' in game:
+                                away, home = game.split('@')
+                                vegas_rows.append({'team': home, 'opponent_team': away,
+                                                   'implied_total': 22.0, 'is_fav': False})
+                                vegas_rows.append({'team': away, 'opponent_team': home,
+                                                   'implied_total': 22.0, 'is_fav': False})
+                        if vegas_rows:
+                            vegas_rows = pd.DataFrame(vegas_rows).drop_duplicates('team').to_dict('records')
+                except Exception as e:
+                    print(f"[Warning] Could not parse DK Game Info: {e}")
 
         if not vegas_rows:
             print(f"[Warning] No schedule found for {self.target_season} week {self.week}; using defaults.")
@@ -139,35 +141,40 @@ class DKCoreDataEngine:
                 'proj_team_rec': 24.2,
                 'proj_team_rush': 25.6,
                 'is_fav': False,
+                'completion_rate': 0.62,
             })
 
         vegas = pd.DataFrame(vegas_rows)
         vegas['v_mod'] = vegas['implied_total'] / 22.0
 
-        # --- Historical play-volume + pass-rate baselines (stats_season) ---
+        # --- Team play-volume + pass-rate + completion-rate baselines ---
         hist = self.master_weekly.copy()
         team_games = (hist.groupby(['team', 'week'])
                       .agg(pass_att=('pass_attempts', 'sum'),
+                           receptions=('receptions', 'sum'),
                            rush_att=('rush_attempts', 'sum'))
                       .reset_index())
         team_games['plays'] = team_games['pass_att'] + team_games['rush_att']
         team_games['pass_rate'] = team_games['pass_att'] / team_games['plays'].replace(0, pd.NA)
+        team_games['completion_rate'] = team_games['receptions'] / team_games['pass_att'].replace(0, pd.NA)
 
         baselines = (team_games.groupby('team')
                      .agg(avg_plays=('plays', 'mean'),
-                          pass_rate_identity=('pass_rate', 'mean'))
+                          pass_rate_identity=('pass_rate', 'mean'),
+                          completion_rate=('completion_rate', 'mean'))
                      .reset_index())
 
         volume = pd.merge(baselines, vegas, on='team', how='right')
         volume['avg_plays'] = volume['avg_plays'].fillna(64.0)
         volume['pass_rate_identity'] = volume['pass_rate_identity'].fillna(0.60)
+        volume['completion_rate'] = volume['completion_rate'].fillna(0.62)
 
         volume['proj_plays'] = volume['avg_plays'] * (1 + (volume['v_mod'] - 1) * 0.3)
         volume['proj_team_pass'] = volume['proj_plays'] * volume['pass_rate_identity']
-        volume['proj_team_rec']  = volume['proj_team_pass'] * 0.63
+        volume['proj_team_rec']  = (volume['proj_team_pass'] * volume['completion_rate']).clip(upper=26.0)
         volume['proj_team_rush'] = volume['proj_plays'] * (1 - volume['pass_rate_identity'])
 
         volume = volume.rename(columns={'team': 'recent_team'})
         return volume[['recent_team', 'opponent_team', 'implied_total',
                        'proj_plays', 'proj_team_pass', 'proj_team_rec',
-                       'proj_team_rush', 'is_fav']]
+                       'proj_team_rush', 'is_fav', 'completion_rate']]

@@ -21,7 +21,7 @@ class RZOpportunityEngine:
         pbp['is_rz_carry'] = (pbp['rush_attempt'] == 1) & (pbp['qb_kneel'] == 0)
         pbp['is_rz_target'] = (pbp['pass_attempt'] == 1) & (pbp['sack'] == 0)
 
-        # --- Build a name lookup: abbreviated -> full name ---
+        # --- Name lookup from rosters ---
         try:
             roster_raw = nflreadpy.load_rosters([self.season])
             roster = roster_raw.to_pandas() if hasattr(roster_raw, "to_pandas") else pd.DataFrame(roster_raw)
@@ -36,7 +36,7 @@ class RZOpportunityEngine:
             else:
                 lookup = {}
         except Exception as e:
-            print(f"[Warning] Could not load rosters for name lookup: {e}")
+            print(f"[Warning] Could not load rosters: {e}")
             lookup = {}
 
         def to_full(name):
@@ -44,7 +44,6 @@ class RZOpportunityEngine:
                 return name
             return lookup.get(name, name)
 
-        # --- Team totals inside the 10 ---
         team_carries = (pbp[pbp['is_rz_carry']]
                         .groupby(['posteam', 'week']).size()
                         .reset_index(name='team_rz_carries'))
@@ -52,7 +51,6 @@ class RZOpportunityEngine:
                         .groupby(['posteam', 'week']).size()
                         .reset_index(name='team_rz_targets'))
 
-        # --- Player totals inside the 10, using rusher/receiver columns ---
         rz_carry = pbp[pbp['is_rz_carry']].copy()
         rz_carry['rz_player'] = rz_carry['rusher_player_name'].map(to_full)
 

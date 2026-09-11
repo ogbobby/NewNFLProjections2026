@@ -13,8 +13,7 @@ class NFLSimConfigRunner:
             self.player_pool = pd.read_csv(self.csv_path)
         except FileNotFoundError:
             raise FileNotFoundError(
-                f"Could not locate {self.csv_path}. "
-                "Please run dfs_final_model.py first."
+                f"Could not locate {self.csv_path}. Please run dfs_final_model.py first."
             )
 
         required_fields = ['Player', 'Position', 'Team', 'Opponent',
@@ -40,7 +39,6 @@ class NFLSimConfigRunner:
         df = self.get_game_stacks_matrix()
         print(f"[Sim Core] Running {iterations} iterations...")
 
-        names = df['Player'].values
         projections = df['Projection'].values
         std_devs = df['StdDev'].values
 
@@ -48,12 +46,15 @@ class NFLSimConfigRunner:
         sim_results = np.random.normal(
             loc=projections[:, np.newaxis],
             scale=std_devs[:, np.newaxis],
-            size=(len(names), iterations)
+            size=(len(projections), iterations)
         )
         sim_results = np.clip(sim_results, a_min=0, a_max=None)
 
         df['Simulated_Mean'] = np.mean(sim_results, axis=1).round(2)
+        df['Simulated_Median'] = np.median(sim_results, axis=1).round(2)
+        df['Simulated_85th'] = np.percentile(sim_results, 85, axis=1).round(2)
         df['Ceiling_95th'] = np.percentile(sim_results, 95, axis=1).round(2)
+        df['Ceiling_99th'] = np.percentile(sim_results, 99, axis=1).round(2)
         df['Boom_Percentage'] = np.mean(sim_results >= 25, axis=1).round(4) * 100
 
         df = df.sort_values(by='Ceiling_95th', ascending=False)
@@ -70,5 +71,7 @@ if __name__ == "__main__":
     )
     results = runner.execute_mock_simulation_trial(iterations=5000)
     print("\nTop 12 by 95th percentile ceiling:")
-    print(results[['Player', 'Position', 'Projection', 'StdDev',
-                   'Ceiling_95th', 'Boom_Percentage', 'Ownership']].head(12))
+    display_cols = ['Player', 'Position', 'Projection', 'Ceiling', 'Ceiling_95th',
+                    'Ceiling_99th', 'Boom_Percentage', 'Ownership', 'Leverage']
+    display_cols = [c for c in display_cols if c in results.columns]
+    print(results[display_cols].head(12))
