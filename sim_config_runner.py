@@ -16,11 +16,55 @@ class NFLSimConfigRunner:
                 f"Could not locate {self.csv_path}. Please run dfs_final_model.py first."
             )
 
-        required_fields = ['Player', 'Position', 'Team', 'Opponent',
-                           'Projection', 'StdDev', 'Salary', 'Ownership']
-        for field in required_fields:
-            if field not in self.player_pool.columns:
-                raise ValueError(f"Missing required simulation field: {field}")
+        print(f"[Sim Config] Detected columns: {self.player_pool.columns.tolist()}")
+
+        # --- Normalize column names: accept TitleCase or snake_case ---
+        aliases = {
+            'Player':          ['Player', 'player_name', 'name', 'full_name'],
+            'Position':        ['Position', 'position', 'pos'],
+            'Team':            ['Team', 'recent_team', 'team'],
+            'Opponent':        ['Opponent', 'opponent_team', 'opp'],
+            'Projection':      ['Projection', 'gpp_projection', 'final_projection', 'proj'],
+            'Ceiling':         ['Ceiling', 'ceiling_projection'],
+            'StdDev':          ['StdDev', 'historical_std', 'std_dev', 'stddev'],
+            'Salary':          ['Salary', 'salary'],
+            'Ownership':       ['Ownership', 'ownership'],
+            'Leverage':        ['Leverage', 'leverage_score', 'leverage'],
+            'Ceiling_Ratio':   ['Ceiling_Ratio', 'ceiling_ratio'],
+            'Usage_Stability': ['Usage_Stability', 'usage_stability'],
+            'AvgPointsPerGame':['AvgPointsPerGame', 'avg_points_per_game'],
+        }
+
+        rename_map = {}
+        for canonical, candidates in aliases.items():
+            if canonical in self.player_pool.columns:
+                continue
+            for cand in candidates:
+                if cand in self.player_pool.columns:
+                    rename_map[cand] = canonical
+                    break
+        if rename_map:
+            print(f"[Sim Config] Renaming columns: {rename_map}")
+            self.player_pool = self.player_pool.rename(columns=rename_map)
+
+        # --- Verify required fields ---
+        required = ['Player', 'Position', 'Team', 'Opponent',
+                    'Projection', 'StdDev', 'Salary', 'Ownership']
+        missing = [f for f in required if f not in self.player_pool.columns]
+        if missing:
+            raise ValueError(
+                f"Missing required simulation fields after normalization: {missing}\n"
+                f"Available columns: {self.player_pool.columns.tolist()}\n"
+                f"Fix this by ensuring dfs_final_model.py exports a 'player_name' "
+                f"and 'salary' column — see the [Debug] pre-export columns line "
+                f"in the dfs_final_model.py run output."
+            )
+
+        # --- Coerce numerics ---
+        for col in ['Projection', 'Ceiling', 'StdDev', 'Salary', 'Ownership',
+                    'Leverage', 'Ceiling_Ratio', 'Usage_Stability', 'AvgPointsPerGame']:
+            if col in self.player_pool.columns:
+                self.player_pool[col] = pd.to_numeric(self.player_pool[col], errors='coerce').fillna(0.0)
 
         print(f"[Sim Config] Loaded {len(self.player_pool)} players.")
         return self.player_pool
@@ -71,7 +115,8 @@ if __name__ == "__main__":
     )
     results = runner.execute_mock_simulation_trial(iterations=5000)
     print("\nTop 12 by 95th percentile ceiling:")
-    display_cols = ['Player', 'Position', 'Projection', 'Ceiling', 'Ceiling_95th',
-                    'Ceiling_99th', 'Boom_Percentage', 'Ownership', 'Leverage']
+    display_cols = ['Player', 'Position', 'Projection', 'Ceiling',
+                    'Ceiling_95th', 'Ceiling_99th', 'Boom_Percentage',
+                    'Ownership', 'Leverage']
     display_cols = [c for c in display_cols if c in results.columns]
     print(results[display_cols].head(12))
