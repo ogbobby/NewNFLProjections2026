@@ -7,19 +7,26 @@ from redzone_engine import RZOpportunityEngine
 
 POSITION_CALIBRATION = {
     'QB': 0.80,
-    'RB': 0.97,
-    'WR': 0.85,
-    'TE': 0.88,
+    'RB': 0.85, #was .97
+    'WR': 0.75, #WAS .85
+    'TE': 0.78, #was .88
 }
 
 POSITION_CAPS = {
     'QB': 26.0,
-    'RB': 32.0,
+    'RB': 30.0,
     'WR': 30.0,
     'TE': 24.0,
 }
 
 MANUAL_ADJUSTMENTS_FILE = 'manual_adjustments.csv'
+
+def norm_name(n):
+    if pd.isna(n):
+        return ''
+    return (str(n).replace('.', '').replace("'", '').replace('-', ' ')
+            .replace(' Jr', '').replace(' Sr', '').replace(' III', '')
+            .lower().strip())
 
 
 class DKSimulatorDataPipeline:
@@ -56,15 +63,41 @@ class DKSimulatorDataPipeline:
         return variance_df[['player_id', 'historical_std']]
 
     def _prune_to_starters(self, dataframe):
-        """Keep only plausible starters per team by salary rank."""
+        """
+        Keep only plausible starters per team by salary rank.
+        QB: 1 per team (or 0 if tied salary between top 2)
+        RB: 2 per team
+        WR: 5 per team
+        TE: 2 per team
+        """
         if 'salary' not in dataframe.columns:
             print("[Engine] No salary column — skipping starter pruning.")
             return dataframe
 
         df = dataframe.copy()
         df['salary'] = pd.to_numeric(df['salary'], errors='coerce').fillna(0)
-        pos_limits = {'QB': 1, 'RB': 2, 'WR': 5, 'TE': 2}
-        keep_pieces = []
+
+        # --- QB pruning: highest salary only, drop tied-salary teams ---
+        qb_mask = df['position'] == 'QB'
+        if qb_mask.any():
+            qb_df = df[qb_mask].copy()
+            qb_df['team_qb_rank'] = qb_df.groupby('recent_team')['salary'].rank(
+                ascending=False, method='min'
+            )
+            # Highest-salary QBs (rank == 1). If a team has ties at rank 1, we drop both.
+            top_rank = qb_df[qb_df['team_qb_rank'] == 1]
+            tied_teams = top_rank.groupby('recent_team').filter(lambda g: len(g) > 1)['recent_team'].unique().tolist()
+            if tied_teams:
+                print(f"[Engine] Ambiguous QB starter (tied salary) — dropping both: {sorted(tied_teams)}")
+            keep_qb_ids = top_rank[~top_rank['recent_team'].isin(tied_teams)].index.tolist()
+
+            before_qb = qb_mask.sum()
+            df = df[(~qb_mask) | (df.index.isin(keep_qb_ids))].copy()
+            print(f"[Engine] Pruned QBs: {before_qb} -> {len(keep_qb_ids)}")
+
+        # --- Other positions: keep top N by salary per team ---
+        pos_limits = {'RB': 2, 'WR': 5, 'TE': 2}
+        keep_pieces = [df[df['position'] == 'QB']]  # QBs already pruned
 
         for pos, limit in pos_limits.items():
             pos_df = df[df['position'] == pos].copy()
@@ -75,11 +108,9 @@ class DKSimulatorDataPipeline:
             )
             before = len(pos_df)
             pos_df = pos_df[pos_df['team_rank'] <= limit].drop(columns=['team_rank'])
-            print(f"[Engine] Pruned {pos}: {before} → {len(pos_df)}")
+            print(f"[Engine] Pruned {pos}: {before} -> {len(pos_df)}")
             keep_pieces.append(pos_df)
 
-        if not keep_pieces:
-            return df
         return pd.concat(keep_pieces, ignore_index=True)
 
     def _apply_backup_rb_discount(self, dataframe):
@@ -236,30 +267,69 @@ class DKSimulatorDataPipeline:
         return result
 
     def _apply_qb_market_prior(self, final_df):
+        """
+        Rebuild QB projections from three signals: implied team total (50%),
+        salary rank (30%), and model output (20%). This overrides the underlying
+        model's tendency to overrate low-sample QBs on bad teams.
+        """
         qb_mask = final_df['position'] == 'QB'
-        if qb_mask.sum() == 0 or 'salary' not in final_df.columns:
+        if qb_mask.sum() == 0:
             return final_df
 
-        qb_salaries = final_df.loc[qb_mask, 'salary'].fillna(5000)
-        sal_min, sal_max = qb_salaries.min(), qb_salaries.max()
+        df = final_df.copy()
+
+        # Implied team total — from the team_volumes merge, already on the frame as
+        # 'implied_total'. If missing, fall back to a default.
+        if 'implied_total' not in df.columns:
+            print("[Warning] No implied_total column for QB market prior")
+            return final_df
+
+        # Salary percentile within QBs
+        qb_df = df[qb_mask].copy()
+        qb_sal = qb_df['salary'].fillna(5000)
+        sal_min, sal_max = qb_sal.min(), qb_sal.max()
         if sal_max > sal_min:
-            qb_norm = (qb_salaries - sal_min) / (sal_max - sal_min)
+            qb_sal_norm = (qb_sal - sal_min) / (sal_max - sal_min)
         else:
-            qb_norm = pd.Series(0.5, index=qb_salaries.index)
+            qb_sal_norm = pd.Series(0.5, index=qb_sal.index)
 
-        market_proj = 12.0 + qb_norm * 14.0
-        MARKET_WEIGHT_QB = 0.40
+        # Implied total scaled: 16-30 implied → 12-20 points
+        qb_implied = qb_df['implied_total'].fillna(22.0)
+        implied_scaled = 12.0 + (qb_implied - 16.0) * 0.6
+        implied_scaled = implied_scaled.clip(10, 22)
 
-        print("[Engine] Applying QB market prior (40% salary-implied blend)...")
-        final_df.loc[qb_mask, 'gpp_projection'] = (
-            (1 - MARKET_WEIGHT_QB) * final_df.loc[qb_mask, 'gpp_projection']
-            + MARKET_WEIGHT_QB * market_proj
+        # Salary scaled: bottom salary → 12, top → 22
+        salary_scaled = 12.0 + qb_sal_norm * 10.0
+
+        # Model projection
+        model_proj = qb_df['gpp_projection']
+
+        # Blend: 50% implied, 30% salary, 20% model
+        blended = (
+            0.50 * implied_scaled +
+            0.30 * salary_scaled +
+            0.20 * model_proj
         ).round(2)
-        final_df.loc[qb_mask, 'ceiling_projection'] = (
-            (1 - MARKET_WEIGHT_QB) * final_df.loc[qb_mask, 'ceiling_projection']
-            + MARKET_WEIGHT_QB * market_proj * 1.45
-        ).round(2)
-        return final_df
+
+        # Ceiling scaled proportionally
+        old_ceil = qb_df['ceiling_projection']
+        ratio = (blended / model_proj.replace(0, np.nan)).fillna(1.0)
+        new_ceil = (old_ceil * ratio).round(2)
+
+        df.loc[qb_mask, 'gpp_projection'] = blended
+        df.loc[qb_mask, 'ceiling_projection'] = new_ceil
+
+        print(f"[Engine] QB projections rebuilt (50% implied / 30% salary / 20% model)")
+        print(f"  Top 5 QBs after rebuild:")
+        top5 = df[qb_mask].nlargest(5, 'gpp_projection')[['player_name', 'recent_team',
+                                                           'gpp_projection', 'salary',
+                                                           'implied_total']]
+        for _, r in top5.iterrows():
+            print(f"    {r['player_name']:<25} {r['recent_team']:<5} "
+                  f"proj={r['gpp_projection']:.2f} sal=${int(r['salary'])} "
+                  f"implied={r['implied_total']:.1f}")
+
+        return df
 
     def _apply_soft_caps(self, final_df):
         print("[Engine] Applying soft position caps...")
@@ -448,8 +518,36 @@ class DKSimulatorDataPipeline:
         final_df['leverage_score'] = final_df['leverage_score'].fillna(0)
 
         # ============================================================
+        # EWMA BLEND — incorporates last week's actual results
+        # ============================================================
+
+        if os.path.exists('last_week_results.csv'):
+            last_week = pd.read_csv('last_week_results.csv')
+            last_week['_key'] = last_week['player_name'].map(norm_name)
+            
+            alpha_by_pos = {'QB': 0.83, 'RB': 0.82, 'WR': 0.85, 'TE': 0.85, 'DST': 0.90}
+            
+            blend_count = 0
+            for idx, row in final_df.iterrows():
+                pos = row['position']
+                alpha = alpha_by_pos.get(pos, 0.85)
+                match = last_week[last_week['_key'] == norm_name(row['player_name'])]
+                if not match.empty:
+                    actual = match.iloc[0]['actual_dk']
+                    old_proj = row['gpp_projection']
+                    new_proj = alpha * old_proj + (1 - alpha) * actual
+                    final_df.at[idx, 'gpp_projection'] = round(new_proj, 2)
+                    if old_proj > 0:
+                        ratio = new_proj / old_proj
+                        final_df.at[idx, 'ceiling_projection'] = round(row['ceiling_projection'] * ratio, 2)
+                    blend_count += 1
+            
+            print(f"[EWMA] Blended {blend_count} players with last week's actuals")
+
+        # ============================================================
         # EXPORT
         # ============================================================
+
         sim_input_cols = {
             'player_name': 'Player', 'position': 'Position', 'recent_team': 'Team',
             'opponent_team': 'Opponent', 'gpp_projection': 'Projection',

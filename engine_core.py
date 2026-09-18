@@ -92,7 +92,11 @@ class DKCoreDataEngine:
         if self._loaded:
             return
         print(f"[Core] Pulling {self.stats_season} stats and {self.target_season} schedule...")
-        weekly_raw = nflreadpy.load_player_stats([self.stats_season])
+        #weekly_raw = nflreadpy.load_player_stats([self.stats_season])
+        # Load two prior seasons so injured players have enough sample for shrinkage
+        seasons_to_load = [self.stats_season - 1, self.stats_season]
+        print(f"[Core] Loading stats from seasons {seasons_to_load}")
+        weekly_raw = nflreadpy.load_player_stats(seasons_to_load)
         try:
             schedule_raw = nflreadpy.load_schedules([self.target_season])
         except Exception as e:
@@ -160,10 +164,17 @@ class DKCoreDataEngine:
         # ============================================================
         # A player's 2025 share should be measured against the 2025 offense
         # they actually played in, not the 2026 team they'll play for.
-        df['team_pass_attempts'] = df.groupby(['historical_team', 'week'])['pass_attempts'].transform('sum').replace(0, np.nan)
-        df['team_rush_attempts'] = df.groupby(['historical_team', 'week'])['rush_attempts'].transform('sum').replace(0, np.nan)
-        df['team_receptions']    = df.groupby(['historical_team', 'week'])['receptions'].transform('sum').replace(0, np.nan)
-        df['team_targets']       = df.groupby(['historical_team', 'week'])['targets'].transform('sum').replace(0, np.nan)
+        #df['team_pass_attempts'] = df.groupby(['historical_team', 'week'])['pass_attempts'].transform('sum').replace(0, np.nan)
+        #df['team_rush_attempts'] = df.groupby(['historical_team', 'week'])['rush_attempts'].transform('sum').replace(0, np.nan)
+        #df['team_receptions']    = df.groupby(['historical_team', 'week'])['receptions'].transform('sum').replace(0, np.nan)
+        #df['team_targets']       = df.groupby(['historical_team', 'week'])['targets'].transform('sum').replace(0, np.nan)
+        # Include season in the grouping so 2024 week 6 doesn't collide with 2025 week 6
+        season_col = 'season' if 'season' in df.columns else None
+        group_cols = ['historical_team', 'week'] if season_col is None else ['historical_team', season_col, 'week']
+        df['team_pass_attempts'] = df.groupby(group_cols)['pass_attempts'].transform('sum').replace(0, np.nan)
+        df['team_rush_attempts'] = df.groupby(group_cols)['rush_attempts'].transform('sum').replace(0, np.nan)
+        df['team_receptions']    = df.groupby(group_cols)['receptions'].transform('sum').replace(0, np.nan)
+        df['team_targets']       = df.groupby(group_cols)['targets'].transform('sum').replace(0, np.nan)
         # --- DK scoring ---
         pass_pts = df['passing_yards'] * 0.04 + df['passing_tds'] * 4.0 - df['passing_interceptions'] * 1.0
         rush_pts = df['rushing_yards'] * 0.1 + df['rushing_tds'] * 6.0
@@ -314,16 +325,21 @@ class DKCoreDataEngine:
         if not sched.empty:
             for _, g in sched.iterrows():
                 total = g.get('total_line', 44.0)
-                total = 44.0 if pd.isna(total) else total
+                total = 44.0 if pd.isna(total) else float(total)
                 spread = g.get('spread_line', 0.0)
-                spread = 0.0 if pd.isna(spread) else spread
+                spread = 0.0 if pd.isna(spread) else float(spread)
                 home, away = g['home_team'], g['away_team']
-                home_implied = total / 2 - spread / 2
-                away_implied = total / 2 + spread / 2
+            
+                # nflverse convention: positive spread = home team favored
+                home_implied = total / 2 + spread / 2
+                away_implied = total / 2 - spread / 2
+            
                 vegas_rows.append({'team': home, 'opponent_team': away,
-                                   'implied_total': home_implied, 'is_fav': spread < 0})
+                                   'implied_total': home_implied,
+                                   'is_fav': spread > 0})
                 vegas_rows.append({'team': away, 'opponent_team': home,
-                                   'implied_total': away_implied, 'is_fav': spread > 0})
+                                   'implied_total': away_implied,
+                                   'is_fav': spread < 0})
         else:
             if self.dk_salary_csv and pd.io.common.file_exists(self.dk_salary_csv):
                 try:

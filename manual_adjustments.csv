@@ -1,2 +1,7 @@
-player_name,projection_mult,ceiling_mult,notes
-Trey McBride,0.85,0.85,TE1 but ARI offense projects poorly
+player_name,projection_mult,ceiling_mult,force_include,fade,notes
+Kenny Gainwell,0.65,0.65,false,true,RB2 behind Bucky
+Kyler Murray,0.55,0.55,false,true,hes hurt and will be out for a while
+Kevin Austin Jr.,0.00,0.00,false,true,he stinks
+Jake Tonges,0.00,0.00,false,true,Out for year
+Sincere McCormick,0.00,0.00,false,true,hes trash
+Josh Jacobs,0.00,0.00,false,true,suspended
