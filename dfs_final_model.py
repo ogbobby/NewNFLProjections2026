@@ -1,22 +1,23 @@
 import pandas as pd
 import numpy as np
 import os
+import nflreadpy as _nfl
 from engine_pipeline import DKProjectionPipeline
 from redzone_engine import RZOpportunityEngine
 
 
 POSITION_CALIBRATION = {
-    'QB': 0.80,
-    'RB': 0.85, #was .97
-    'WR': 0.75, #WAS .85
-    'TE': 0.78, #was .88
+    'QB': 0.92,
+    'RB': 0.90, #was .97
+    'WR': 0.90, #WAS .85
+    'TE': 0.90, #was .88
 }
 
 POSITION_CAPS = {
-    'QB': 26.0,
-    'RB': 30.0,
-    'WR': 30.0,
-    'TE': 24.0,
+    'QB': 28.0, #was 26
+    'RB': 28.0, #was 30
+    'WR': 28.0, #was 30
+    'TE': 24.0, #was 24
 }
 
 MANUAL_ADJUSTMENTS_FILE = 'manual_adjustments.csv'
@@ -145,46 +146,202 @@ class DKSimulatorDataPipeline:
         return df
 
     def _apply_manual_adjustments(self, dataframe):
-        """
-        Read manual_adjustments.csv and apply per-player multipliers.
-        File format: player_name, projection_mult, ceiling_mult, notes
-        Missing multipliers are treated as 1.0.
-        """
         if not os.path.exists(MANUAL_ADJUSTMENTS_FILE):
-            print(f"[Engine] No {MANUAL_ADJUSTMENTS_FILE} found — skipping manual overrides.")
             return dataframe
-
-        print(f"[Engine] Applying manual overrides from {MANUAL_ADJUSTMENTS_FILE}...")
+    
         adj = pd.read_csv(MANUAL_ADJUSTMENTS_FILE)
-        required = {'player_name', 'projection_mult', 'ceiling_mult'}
-        if not required.issubset(adj.columns):
-            print(f"[Warning] {MANUAL_ADJUSTMENTS_FILE} missing required columns. Found: {adj.columns.tolist()}")
+        if 'player_name' not in adj.columns:
             return dataframe
-
+    
         df = dataframe.copy()
         n_applied = 0
-        n_unmatched = 0
-
+        fade_names = []
+    
         for _, row in adj.iterrows():
             name = str(row['player_name']).strip()
             mask = df['player_name'].astype(str).str.strip() == name
             if mask.sum() == 0:
                 print(f"  [Warning] Manual override for '{name}' did not match any player.")
-                n_unmatched += 1
+                continue
+            
+            is_fade = 'fade' in adj.columns and str(row.get('fade', '')).lower() == 'true'
+            has_override = 'projection_override' in adj.columns and pd.notna(row.get('projection_override'))
+            proj_mult = float(row['projection_mult']) if 'projection_mult' in adj.columns and pd.notna(row.get('projection_mult')) else 1.0
+            ceil_mult = float(row['ceiling_mult']) if 'ceiling_mult' in adj.columns and pd.notna(row.get('ceiling_mult')) else 1.0
+    
+            if is_fade:
+                fade_names.append(name)
+                print(f"  {name}: FADED ({row.get('notes', '')})")
+            elif has_override:
+                # Absolute override — ignores the model's projection entirely
+                old_proj = df.loc[mask, 'gpp_projection'].iloc[0]
+                new_proj = float(row['projection_override'])
+                df.loc[mask, 'gpp_projection'] = round(new_proj, 2)
+                if old_proj > 0:
+                    ratio = new_proj / old_proj
+                    df.loc[mask, 'ceiling_projection'] = (df.loc[mask, 'ceiling_projection'] * ratio).round(2)
+                print(f"  {name}: OVERRIDE proj {old_proj:.2f} → {new_proj:.2f} ({row.get('notes', '')})")
+            else:
+                df.loc[mask, 'gpp_projection'] = (df.loc[mask, 'gpp_projection'] * proj_mult).round(2)
+                df.loc[mask, 'ceiling_projection'] = (df.loc[mask, 'ceiling_projection'] * ceil_mult).round(2)
+                print(f"  {name}: proj × {proj_mult}, ceil × {ceil_mult} ({row.get('notes', '')})")
+    
+            n_applied += 1
+    
+        if fade_names:
+            before = len(df)
+            df = df[~df['player_name'].isin(fade_names)].reset_index(drop=True)
+            print(f"[Fade] Removed {before - len(df)} players")
+    
+        print(f"[Engine] Applied {n_applied} overrides.")
+        return df
+
+    def _add_dk_only_players(self, base_projections, dk_salary_csv, team_implied_map):
+        """
+        Add any player in the DK salary file who isn't in base_projections.
+
+        This handles rookies, mid-season call-ups, and players who didn't
+        accumulate meaningful 2025 stats. Assigns baseline projections based on:
+          - DK salary (market's read on their role)
+          - Position
+          - Team implied total
+          - Depth-chart position (highest-salary player at position = starter)
+        """
+        if not dk_salary_csv or not os.path.exists(dk_salary_csv):
+            print("[Fallback] No DK salary file — skipping DK-only player add")
+            return base_projections
+
+        dk = pd.read_csv(dk_salary_csv)
+        if 'Position' not in dk.columns or 'Name' not in dk.columns:
+            print("[Fallback] DK file missing required columns")
+            return base_projections
+
+        dk = dk[dk['Position'].isin(['QB', 'RB', 'WR', 'TE'])].copy()
+
+        # Normalize names
+        def _norm(n):
+            if pd.isna(n):
+                return ''
+            return (str(n).replace('.', '').replace("'", '').replace('-', ' ')
+                    .replace(' Jr', '').replace(' Sr', '').replace(' III', '')
+                    .lower().strip())
+
+        dk['_key'] = dk['Name'].map(_norm)
+        base_projections['_key'] = base_projections['player_name'].map(_norm)
+
+        missing = dk[~dk['_key'].isin(base_projections['_key'])].copy()
+
+        if missing.empty:
+            print("[Fallback] No DK-only players to add")
+            return base_projections
+
+        print(f"[Fallback] Adding {len(missing)} DK-only players with baseline projections")
+
+        # Position baseline ranges: (min_salary, max_salary, min_proj, max_proj)
+        POS_BASELINE = {
+            'QB': (4000, 8000, 10.0, 22.0),
+            'RB': (4000, 8500,  5.0, 18.0),
+            'WR': (3000, 9000,  3.0, 15.0),
+            'TE': (2500, 7000,  3.0, 12.0),
+        }
+
+        new_rows = []
+        for _, row in missing.iterrows():
+            pos = row['Position']
+            salary = float(row.get('Salary', 4000))
+            team = row.get('TeamAbbrev', 'UNK')
+
+            if pos not in POS_BASELINE:
                 continue
 
-            proj_mult = float(row['projection_mult']) if pd.notna(row['projection_mult']) else 1.0
-            ceil_mult = float(row['ceiling_mult']) if pd.notna(row['ceiling_mult']) else 1.0
+            min_sal, max_sal, min_proj, max_proj = POS_BASELINE[pos]
+            sal_frac = max(min((salary - min_sal) / (max_sal - min_sal), 1.0), 0.0)
+            baseline = min_proj + sal_frac * (max_proj - min_proj)
 
-            df.loc[mask, 'gpp_projection']     = (df.loc[mask, 'gpp_projection']     * proj_mult).round(2)
-            df.loc[mask, 'ceiling_projection'] = (df.loc[mask, 'ceiling_projection'] * ceil_mult).round(2)
+            # Team implied adjustment
+            implied = team_implied_map.get(team, 22.0)
+            team_mod = (implied / 22.0) ** 1.2
 
-            note = row.get('notes', '')
-            print(f"  {name}: proj × {proj_mult}, ceil × {ceil_mult}{'  (' + str(note) + ')' if note else ''}")
-            n_applied += 1
+            proj = baseline * team_mod
 
-        print(f"[Engine] Applied {n_applied} overrides ({n_unmatched} unmatched).")
-        return df
+            # Depth chart bump: if this player is the highest-salary at his
+            # position on his team, he's likely the starter
+            team_pos = dk[(dk['TeamAbbrev'] == team) & (dk['Position'] == pos)]
+            if not team_pos.empty and salary >= team_pos['Salary'].max():
+                proj *= 1.4  # starter bump
+
+            # Rookie / unknown discount: pull toward the mean
+            proj *= 0.85
+
+            proj = round(max(proj, 1.0), 2)
+
+            # Ceiling and std dev
+            ceiling = round(proj * 1.65, 2)
+            stddev = round(max(proj * 0.55, 3.0), 2)
+
+            new_rows.append({
+                'player_name': row['Name'],
+                'position': pos,
+                'recent_team': team,
+                'opponent_team': '',
+                'final_projection': proj,
+                'ceiling_projection': ceiling,
+                'ceiling_multiplier': 1.65,
+                'usage_stability': 0.3,
+                'is_fallback': True,
+            })
+
+        if not new_rows:
+            print("[Fallback] No valid baseline projections generated")
+            return base_projections
+
+        fallback_df = pd.DataFrame(new_rows)
+        combined = pd.concat([base_projections, fallback_df], ignore_index=True)
+        print(f"[Fallback] Total players: {len(combined)} (added {len(fallback_df)})")
+
+        return combined
+
+    #def _apply_manual_adjustments(self, dataframe):
+    #    """
+    #    Read manual_adjustments.csv and apply per-player multipliers.
+    #    File format: player_name, projection_mult, ceiling_mult, notes
+    #    Missing multipliers are treated as 1.0.
+    #    """
+    #    if not os.path.exists(MANUAL_ADJUSTMENTS_FILE):
+    #        print(f"[Engine] No {MANUAL_ADJUSTMENTS_FILE} found — skipping manual overrides.")
+    #        return dataframe
+#
+    #    print(f"[Engine] Applying manual overrides from {MANUAL_ADJUSTMENTS_FILE}...")
+    #    adj = pd.read_csv(MANUAL_ADJUSTMENTS_FILE)
+    #    required = {'player_name', 'projection_mult', 'ceiling_mult'}
+    #    if not required.issubset(adj.columns):
+    #        print(f"[Warning] {MANUAL_ADJUSTMENTS_FILE} missing required columns. Found: {adj.columns.tolist()}")
+    #        return dataframe
+#
+    #    df = dataframe.copy()
+    #    n_applied = 0
+    #    n_unmatched = 0
+#
+    #    for _, row in adj.iterrows():
+    #        name = str(row['player_name']).strip()
+    #        mask = df['player_name'].astype(str).str.strip() == name
+    #        if mask.sum() == 0:
+    #            print(f"  [Warning] Manual override for '{name}' did not match any player.")
+    #            n_unmatched += 1
+    #            continue
+#
+    #        proj_mult = float(row['projection_mult']) if pd.notna(row['projection_mult']) else 1.0
+    #        ceil_mult = float(row['ceiling_mult']) if pd.notna(row['ceiling_mult']) else 1.0
+#
+    #        df.loc[mask, 'gpp_projection']     = (df.loc[mask, 'gpp_projection']     * proj_mult).round(2)
+    #        df.loc[mask, 'ceiling_projection'] = (df.loc[mask, 'ceiling_projection'] * ceil_mult).round(2)
+#
+    #        note = row.get('notes', '')
+    #        print(f"  {name}: proj × {proj_mult}, ceil × {ceil_mult}{'  (' + str(note) + ')' if note else ''}")
+    #        n_applied += 1
+#
+    #    print(f"[Engine] Applied {n_applied} overrides ({n_unmatched} unmatched).")
+    #    return df
 
     def model_algorithmic_ownership(self, dataframe):
         print("[Engine] Calculating market-consensus field ownership curves...")
@@ -337,13 +494,13 @@ class DKSimulatorDataPipeline:
             mask = (final_df['position'] == pos) & (final_df['gpp_projection'] > cap)
             if mask.any():
                 excess = final_df.loc[mask, 'gpp_projection'] - cap
-                final_df.loc[mask, 'gpp_projection'] = (cap + np.log1p(excess) * 2.0).round(2)
+                final_df.loc[mask, 'gpp_projection'] = (cap + np.log1p(excess) * 0.8).round(2)
 
-            ceil_cap = cap * 1.55
+            ceil_cap = cap * 1.45
             mask_c = (final_df['position'] == pos) & (final_df['ceiling_projection'] > ceil_cap)
             if mask_c.any():
                 excess = final_df.loc[mask_c, 'ceiling_projection'] - ceil_cap
-                final_df.loc[mask_c, 'ceiling_projection'] = (ceil_cap + np.log1p(excess) * 2.5).round(2)
+                final_df.loc[mask_c, 'ceiling_projection'] = (ceil_cap + np.log1p(excess) * 1.0).round(2)
 
             n_proj = mask.sum()
             n_ceil = mask_c.sum()
@@ -354,7 +511,40 @@ class DKSimulatorDataPipeline:
     def run_gpp_optimized_pipeline(self, injuries=None):
         base_projections = self.base_pipeline.run_full_pipeline(injured_players_dict=injuries)
         print(f"[Debug] base_projections rows: {len(base_projections)}")
+        # Build team implied map for fallback projections
+        try:
+            _sched = _nfl.load_schedules([self.target_season]).to_pandas()
+            _type_col = 'game_type' if 'game_type' in _sched.columns else 'season_type'
+            _sched = _sched[(_sched['week'] == self.week) & (_sched[_type_col] == 'REG')]
+            team_implied_map = {}
+            for _, g in _sched.iterrows():
+                total = g.get('total_line', 44.0)
+                total = 44.0 if pd.isna(total) else float(total)
+                spread = g.get('spread_line', 0.0)
+                spread = 0.0 if pd.isna(spread) else float(spread)
+                home_implied = total / 2 + spread / 2
+                away_implied = total / 2 - spread / 2
+                team_implied_map[g['home_team']] = home_implied
+                team_implied_map[g['away_team']] = away_implied
+        except Exception as e:
+            print(f"[Fallback] Could not build team implied map: {e}")
+            team_implied_map = {}
 
+        # Add DK-only players (rookies, mid-season call-ups)
+        base_projections = self._add_dk_only_players(
+            base_projections,
+            self.dk_salary_csv,
+            team_implied_map,
+        )
+        # Fill in missing columns for fallback rows
+        fallback_mask = base_projections.get('is_fallback', False) == True
+        if fallback_mask.any():
+            # Fill opponent_team from the team_implied_map for known teams
+            # or leave blank for unknown teams (UNK)
+            base_projections.loc[fallback_mask, 'implied_total'] = \
+                base_projections.loc[fallback_mask, 'recent_team'].map(team_implied_map).fillna(22.0)
+            base_projections.loc[fallback_mask, 'is_fav'] = False
+            base_projections.loc[fallback_mask, 'dvp_multiplier'] = 1.0
         if base_projections is None or base_projections.empty:
             raise RuntimeError("base_projections is empty.")
 
@@ -587,7 +777,7 @@ if __name__ == "__main__":
     model = DKSimulatorDataPipeline(
         stats_season=2025,
         target_season=2026,
-        target_week=1,
+        target_week=4,
         dk_salary_csv="DKSalaries.csv",
     )
     active_injuries = {}

@@ -22,253 +22,345 @@ class DKProjectionPipeline:
         w = n_games_series / (n_games_series + SHRINKAGE_K)
         return (w * eff_series + (1 - w) * pos_mean).fillna(pos_mean)
 
-    def allocate_and_synthesize(self, team_volumes, injured_players=None):
-        print("[Pipeline] Computing micro volume market shares...")
-        hist_data = self.core.master_weekly.copy().sort_values(by=['player_id', 'week'])
-        injuries = injured_players if injured_players else {}
-
-        if hist_data.empty:
-            raise RuntimeError("hist_data is empty.")
-
-        hist_data['player_pass_share']   = (hist_data['pass_attempts'] / hist_data['team_pass_attempts']).fillna(0.0).clip(0, 1)
-        hist_data['player_rush_share']   = (hist_data['rush_attempts'] / hist_data['team_rush_attempts']).fillna(0.0).clip(0, 1)
-        hist_data['player_target_share'] = (hist_data['targets']       / hist_data['team_targets']).fillna(0.0).clip(0, 1)
-
-        rec_points_earned  = hist_data['receptions'] * 1.0 + hist_data['receiving_yards'] * 0.1 + hist_data['receiving_tds'] * 6.0
-        rush_points_earned = hist_data['rushing_yards'] * 0.1 + hist_data['rushing_tds'] * 6.0
-        pass_points_earned = (hist_data['passing_yards'] * 0.04
-                              + hist_data['passing_tds'] * 4.0
-                              - hist_data['passing_interceptions'] * 1.0)
-        fumbles = (hist_data['sack_fumbles_lost']
-                   + hist_data['rushing_fumbles_lost']
-                   + hist_data['receiving_fumbles_lost'])
-
-        hist_data['rec_points_earned']  = rec_points_earned
-        hist_data['rush_points_earned'] = rush_points_earned - fumbles * 2.0
-        hist_data['pass_points_earned'] = pass_points_earned
-
-        # ============================================================
-        # WEIGHTED-AVERAGE EFFICIENCY (season totals, not per-game means)
-        # ============================================================
-        player_agg = hist_data.groupby('player_id').agg(
-            total_pass_att=('pass_attempts', 'sum'),
-            total_pass_pts=('pass_points_earned', 'sum'),
-            total_rush_att=('rush_attempts', 'sum'),
-            total_rush_pts=('rush_points_earned', 'sum'),
-            total_targets=('targets', 'sum'),
-            total_rec_pts=('rec_points_earned', 'sum'),
-            total_games=('week', 'count'),
-        ).reset_index()
-
-        player_agg['eff_pass_raw']   = (player_agg['total_pass_pts']   / player_agg['total_pass_att'].replace(0, np.nan)).fillna(0)
-        player_agg['eff_rush_raw']   = (player_agg['total_rush_pts']   / player_agg['total_rush_att'].replace(0, np.nan)).fillna(0)
-        player_agg['eff_target_raw'] = (player_agg['total_rec_pts']    / player_agg['total_targets'].replace(0, np.nan)).fillna(0)
-
-        player_agg['eff_pass']   = self._shrink(player_agg['eff_pass_raw'],   player_agg['total_games'], POSITION_MEAN_EFF['pass'])
-        player_agg['eff_rush']   = self._shrink(player_agg['eff_rush_raw'],   player_agg['total_games'], POSITION_MEAN_EFF['rush'])
-        player_agg['eff_target'] = self._shrink(player_agg['eff_target_raw'], player_agg['total_games'], POSITION_MEAN_EFF['target'])
-
-        # ============================================================
-        # TEAM PASSING EFFICIENCY (for QB context)
-        # ============================================================
-        team_week_eff = (
-            hist_data.groupby(['team', 'week'])
-            .apply(lambda g: g['pass_points_earned'].sum() / max(g['pass_attempts'].sum(), 1))
-            .reset_index(name='team_pass_eff')
-        )
-        team_pass_eff = team_week_eff.groupby('team')['team_pass_eff'].mean().to_dict()
-
-        # ============================================================
-        # PER-POSITION LOOP
-        # ============================================================
-        player_records = []
-        for pos, span in self.core.POSITION_WINDOWS.items():
-            pos_df = hist_data[hist_data['position'] == pos].copy()
-            print(f"[Debug] position={pos}: {len(pos_df)} rows")
-            if pos_df.empty:
-                continue
-            
-            pos_df['games_played'] = pos_df.groupby('player_id')['week'].transform('count')
-
-            pos_df['base_pass_share']   = pos_df.groupby('player_id')['player_pass_share'].transform(lambda x: x.ewm(span=span, min_periods=1).mean())
-            pos_df['base_rush_share']   = pos_df.groupby('player_id')['player_rush_share'].transform(lambda x: x.ewm(span=span, min_periods=1).mean())
-            pos_df['base_target_share'] = pos_df.groupby('player_id')['player_target_share'].transform(lambda x: x.ewm(span=span, min_periods=1).mean())
-
-            pos_df['pass_share_std']   = pos_df.groupby('player_id')['player_pass_share'].transform('std').fillna(0)
-            pos_df['rush_share_std']   = pos_df.groupby('player_id')['player_rush_share'].transform('std').fillna(0)
-            pos_df['target_share_std'] = pos_df.groupby('player_id')['player_target_share'].transform('std').fillna(0)
-
-            latest = pos_df.groupby('player_id').last().reset_index()
-            latest = latest.merge(
-                player_agg[['player_id', 'eff_pass', 'eff_rush', 'eff_target']],
-                on='player_id', how='left'
-            )
-            latest['team_pass_eff'] = latest['team'].map(team_pass_eff).fillna(POSITION_MEAN_EFF['pass'])
-
-            player_records.append(latest[[
-                'player_id', 'player_name', 'position', 'team',
-                'base_pass_share', 'base_rush_share', 'base_target_share',
-                'eff_pass', 'eff_rush', 'eff_target', 'team_pass_eff',
-                'pass_share_std', 'rush_share_std', 'target_share_std'
-            ]])
-
-        if not player_records:
-            raise RuntimeError("player_records is empty.")
-
-        df_players = pd.concat(player_records, ignore_index=True).rename(columns={'team': 'recent_team'})
-        print(f"[Debug] df_players rows: {len(df_players)}")
-
-        TEAM_ALIASES = {
-            'LA': 'LAR', 'STL': 'LAR', 'SL': 'LAR',
-            'SD': 'LAC', 'OAK': 'LV', 'LVR': 'LV',
-            'WSH': 'WAS', 'JAC': 'JAX', 'ARZ': 'ARI',
-            'BLT': 'BAL', 'CLV': 'CLE', 'HST': 'HOU',
-        }
-        df_players['recent_team'] = df_players['recent_team'].replace(TEAM_ALIASES)
-        team_volumes = team_volumes.copy()
-        team_volumes['recent_team'] = team_volumes['recent_team'].replace(TEAM_ALIASES)
-
-        for injured_name, details in injuries.items():
-            if injured_name in df_players['player_name'].values:
-                match = df_players[df_players['player_name'] == injured_name].iloc[0]
-                team = match['recent_team']
-                p_share = match['base_pass_share']
-                r_share = match['base_rush_share']
-                c_share = match['base_target_share']
-
-                df_players.loc[df_players['player_name'] == injured_name,
-                               ['base_pass_share', 'base_rush_share', 'base_target_share']] = 0.0
-                team_mask = (df_players['recent_team'] == team) & (df_players['player_name'] != injured_name)
-
-                if details['pos'] in ['WR', 'TE']:
-                    df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_pass_share'] += p_share * 0.70
-                    df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_pass_share'] += p_share * 0.30
-                    df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_target_share'] += c_share * 0.70
-                    df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_target_share'] += c_share * 0.30
-                elif details['pos'] == 'RB':
-                    df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_rush_share'] += r_share * 0.80
-                    df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_rush_share'] += r_share * 0.20
-                    df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_target_share'] += c_share * 0.55
-                    df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_target_share'] += c_share * 0.45
-
-        merged = pd.merge(df_players, team_volumes, on='recent_team', how='left')
-
-        defaults = {'proj_plays': 64.0, 'proj_team_pass': 38.4, 'proj_team_rec': 24.2,
-                    'proj_team_rush': 25.6, 'implied_total': 22.0, 'completion_rate': 0.62}
-        for col, default in defaults.items():
-            if col in merged.columns:
-                merged[col] = merged[col].fillna(default)
-            else:
-                merged[col] = default
-
-        if 'opponent_team' in merged.columns:
-            merged['opponent_team'] = merged['opponent_team'].fillna('UNK')
-        else:
-            merged['opponent_team'] = 'UNK'
-        if 'is_fav' in merged.columns:
-            merged['is_fav'] = merged['is_fav'].fillna(False)
-        else:
-            merged['is_fav'] = False
-
-        # ============================================================
-        # BLEND TEAM EFFICIENCY INTO QB EFFICIENCY
-        # ============================================================
-        qb_mask = merged['position'] == 'QB'
-        merged.loc[qb_mask, 'eff_pass'] = (
-            0.5 * merged.loc[qb_mask, 'eff_pass']
-            + 0.5 * merged.loc[qb_mask, 'team_pass_eff']
-        )
-
-        # Position-aware team-quality scaling
-        base_quality = (merged['implied_total'] / 22.0).clip(0.70, 1.40)
-        merged['team_quality_mod'] = np.where(
-            merged['position'] == 'QB',
-            base_quality ** 1.6,
-            np.where(
-                merged['position'].isin(['WR', 'TE']),
-                base_quality ** 1.4,
-                base_quality ** 1.1
-            )
-        )
-
-        high_usage = (
-            (merged['position'].isin(['WR', 'TE']) & (merged['base_target_share'] >= 0.22)) |
-            ((merged['position'] == 'RB') & (merged['base_rush_share'] >= 0.55))
-        )
-        elite_pass_catcher = (
-            (merged['position'].isin(['WR', 'TE']) & (merged['base_target_share'] >= 0.25)) |
-            ((merged['position'] == 'RB') & (merged['base_target_share'] >= 0.15) & (merged['base_rush_share'] >= 0.55))
-        )
-
-        merged['team_quality_mod'] = np.where(
-            high_usage,
-            np.maximum(merged['team_quality_mod'], 0.90),
-            merged['team_quality_mod']
-        )
-        merged['team_quality_mod'] = np.where(
-            elite_pass_catcher,
-            np.maximum(merged['team_quality_mod'], 0.95) * 1.05,
-            merged['team_quality_mod']
-        )
-
-        merged['proj_pass_volume'] = merged['proj_team_pass'] * merged['base_pass_share'] * merged['team_quality_mod']
-        merged['proj_rush_volume'] = merged['proj_team_rush'] * merged['base_rush_share'] * merged['team_quality_mod']
-        merged['proj_team_targets'] = merged['proj_team_rec'] / merged['completion_rate'].replace(0, 0.62)
-        merged['proj_target_volume'] = merged['proj_team_targets'] * merged['base_target_share'] * merged['team_quality_mod']
-
-        merged['raw_projection'] = (
-            merged['proj_pass_volume'] * merged['eff_pass']
-            + merged['proj_rush_volume'] * merged['eff_rush']
-            + merged['proj_target_volume'] * merged['eff_target']
-        )
-        print(f"[Debug] raw_projection range: {merged['raw_projection'].min():.2f}–{merged['raw_projection'].max():.2f}")
-
-        def ceiling_multiplier(row):
-            pos = row['position']
-            if pos in ['WR', 'TE']:
-                share = row['base_target_share']
-                std   = row['target_share_std']
-                if share >= 0.28:   base = 1.55
-                elif share >= 0.22: base = 1.40
-                elif share >= 0.16: base = 1.25
-                elif share >= 0.10: base = 1.15
-                else:               base = 1.05
-                base += (0.15 - min(std, 0.15)) * 0.5
-            elif pos == 'RB':
-                rush = row['base_rush_share']
-                tgt  = row['base_target_share']
-                std  = row['rush_share_std']
-                if rush >= 0.60 and tgt >= 0.12: base = 1.50
-                elif rush >= 0.50:               base = 1.35
-                elif rush >= 0.35:               base = 1.22
-                elif rush >= 0.20:               base = 1.12
-                else:                            base = 1.02
-                base += (0.15 - min(std, 0.15)) * 0.5
-            elif pos == 'QB':
-                rush = row['base_rush_share']
-                if rush >= 0.15:   base = 1.45
-                elif rush >= 0.10: base = 1.32
-                elif rush >= 0.05: base = 1.22
-                else:              base = 1.12
-            else:
-                base = 1.15
-            return round(base, 3)
-
-        merged['ceiling_multiplier'] = merged.apply(ceiling_multiplier, axis=1)
-        merged['ceiling_projection'] = (merged['raw_projection'] * merged['ceiling_multiplier']).round(2)
-
-        def stability_score(row):
-            if row['position'] in ['WR', 'TE']:
-                std = row['target_share_std']
-            elif row['position'] == 'RB':
-                std = (row['rush_share_std'] + row['target_share_std']) / 2
-            else:
-                std = row['pass_share_std']
-            return round(max(0.0, 1.0 - min(std, 0.25) / 0.25), 3)
-
-        merged['usage_stability'] = merged.apply(stability_score, axis=1)
-        print(f"[Debug] ceiling_projection range: {merged['ceiling_projection'].min():.2f}–{merged['ceiling_projection'].max():.2f}")
-        return merged
+    #def allocate_and_synthesize(self, team_volumes, injured_players=None):
+    #    print("[Pipeline] Computing micro volume market shares...")
+    #    #hist_data = self.core.master_weekly.copy().sort_values(by=['player_id', 'week'])
+    #    sort_cols = ['player_id'] #added 9/30
+    #    if 'season' in self.core.master_weekly.columns:
+    #        sort_cols.append('season')
+    #    sort_cols.append('week')
+    #    hist_data = self.core.master_weekly.copy().sort_values(by=sort_cols)
+    #    injuries = injured_players if injured_players else {}
+#
+    #    if hist_data.empty:
+    #        raise RuntimeError("hist_data is empty.")
+#
+    #    hist_data['player_pass_share']   = (hist_data['pass_attempts'] / hist_data['team_pass_attempts']).fillna(0.0).clip(0, 1)
+    #    hist_data['player_rush_share']   = (hist_data['rush_attempts'] / hist_data['team_rush_attempts']).fillna(0.0).clip(0, 1)
+    #    hist_data['player_target_share'] = (hist_data['targets']       / hist_data['team_targets']).fillna(0.0).clip(0, 1)
+#
+    #    rec_points_earned  = hist_data['receptions'] * 1.0 + hist_data['receiving_yards'] * 0.1 + hist_data['receiving_tds'] * 6.0
+    #    rush_points_earned = hist_data['rushing_yards'] * 0.1 + hist_data['rushing_tds'] * 6.0
+    #    pass_points_earned = (hist_data['passing_yards'] * 0.04
+    #                          + hist_data['passing_tds'] * 4.0
+    #                          - hist_data['passing_interceptions'] * 1.0)
+    #    fumbles = (hist_data['sack_fumbles_lost']
+    #               + hist_data['rushing_fumbles_lost']
+    #               + hist_data['receiving_fumbles_lost'])
+#
+    #    hist_data['rec_points_earned']  = rec_points_earned
+    #    hist_data['rush_points_earned'] = rush_points_earned - fumbles * 2.0
+    #    hist_data['pass_points_earned'] = pass_points_earned
+#
+    #    # ============================================================
+    #    # WEIGHTED-AVERAGE EFFICIENCY (season totals, not per-game means)
+    #    # ============================================================
+    #    #player_agg = hist_data.groupby('player_id').agg(
+    #    #    total_pass_att=('pass_attempts', 'sum'),
+    #    #    total_pass_pts=('pass_points_earned', 'sum'),
+    #    #    total_rush_att=('rush_attempts', 'sum'),
+    #    #    total_rush_pts=('rush_points_earned', 'sum'),
+    #    #    total_targets=('targets', 'sum'),
+    #    #    total_rec_pts=('rec_points_earned', 'sum'),
+    #    #    total_games=('week', 'count'),
+    #    #).reset_index()
+##
+    #    #player_agg['eff_pass_raw']   = (player_agg['total_pass_pts']   / player_agg['total_pass_att'].replace(0, np.nan)).fillna(0)
+    #    #player_agg['eff_rush_raw']   = (player_agg['total_rush_pts']   / player_agg['total_rush_att'].replace(0, np.nan)).fillna(0)
+    #    ##player_agg['eff_target_raw'] = (player_agg['total_rec_pts']    / player_agg['total_targets'].replace(0, np.nan)).fillna(0)
+##
+    #    #player_agg['eff_pass']   = self._shrink(player_agg['eff_pass_raw'],   player_agg['total_games'], POSITION_MEAN_EFF['pass'])
+    #    #player_agg['eff_rush']   = self._shrink(player_agg['eff_rush_raw'],   player_agg['total_games'], POSITION_MEAN_EFF['rush'])
+    #    #player_agg['eff_target'] = self._shrink(player_agg['eff_target_raw'], player_agg['total_games'], POSITION_MEAN_EFF['target'])
+##
+    #    ## New: per-game efficiency, EWM-weighted so recent games count more
+    #    #hist_data['game_pts_per_target'] = (
+    #    #    (hist_data['receptions'] * 1.0 + 
+    #    #     hist_data['receiving_yards'] * 0.1 + 
+    #    #     hist_data['receiving_tds'] * 6.0) / 
+    #    #    hist_data['targets'].replace(0, np.nan)
+    #    #).fillna(0)
+##
+    #    ## EWM average per player, using span from POSITION_WINDOWS
+    #    #hist_data['eff_target_ewm'] = (
+    #    #    hist_data.groupby('player_id')['game_pts_per_target']
+    #    #    .transform(lambda x: x.ewm(span=6, min_periods=1).mean())
+    #    #)
+##
+    #    ## Take the last value per player (which reflects all their EWM'd games)
+    #    #player_agg = (
+    #    #    hist_data
+    #    #    .sort_values(['player_id', 'season', 'week'])
+    #    #    .groupby('player_id')
+    #    #    .agg(
+    #    #        total_games=('season_weight', 'sum'),
+    #    #        eff_target_ewm=('eff_target_ewm', 'last'),
+    #    #    )
+    #    #    .reset_index()
+    #    #)
+    #    #player_agg['eff_target_raw'] = player_agg['eff_target_ewm']
+##
+    #    ## ============================================================
+    #    ## TEAM PASSING EFFICIENCY (for QB context)
+    #    ## ============================================================
+    #    #team_week_eff = (
+    #    #    hist_data.groupby(['team', 'week'])
+    #    #    .apply(lambda g: g['pass_points_earned'].sum() / max(g['pass_attempts'].sum(), 1))
+    #    #    .reset_index(name='team_pass_eff')
+    #    #)
+    #    #team_pass_eff = team_week_eff.groupby('team')['team_pass_eff'].mean().to_dict()
+#
+    #    #put here
+    #    # ============================================================
+    #    # PER-GAME EFFICIENCY — EWM-WEIGHTED (recent games count more)
+    #    # ============================================================
+    #    # Per-game efficiency metrics
+    #    hist_data['game_pts_per_pass_att'] = (
+    #        hist_data['pass_points_earned'] / hist_data['pass_attempts'].replace(0, np.nan)
+    #    ).fillna(0)
+    #    hist_data['game_pts_per_rush_att'] = (
+    #        hist_data['rush_points_earned'] / hist_data['rush_attempts'].replace(0, np.nan)
+    #    ).fillna(0)
+    #    hist_data['game_pts_per_target'] = (
+    #        (hist_data['receptions'] * 1.0
+    #         + hist_data['receiving_yards'] * 0.1
+    #         + hist_data['receiving_tds'] * 6.0)
+    #        / hist_data['targets'].replace(0, np.nan)
+    #    ).fillna(0)
+#
+    #    # EWM average per player
+    #    def ewm_eff(col, span):
+    #        return hist_data.groupby('player_id')[col].transform(
+    #            lambda x: x.ewm(span=span, min_periods=1).mean()
+    #        )
+#
+    #    hist_data['eff_pass_ewm']   = ewm_eff('game_pts_per_pass_att', self.core.POSITION_WINDOWS['QB'])
+    #    hist_data['eff_rush_ewm']   = ewm_eff('game_pts_per_rush_att', self.core.POSITION_WINDOWS['RB'])
+    #    hist_data['eff_target_ewm'] = ewm_eff('game_pts_per_target',   self.core.POSITION_WINDOWS['WR'])
+#
+    #    # Take last EWM value per player
+    #    player_agg = (
+    #        hist_data
+    #        .sort_values(['player_id', 'season', 'week'])
+    #        .groupby('player_id')
+    #        .agg(
+    #            total_games=('season_weight', 'sum'),
+    #            eff_pass_raw=('eff_pass_ewm', 'last'),
+    #            eff_rush_raw=('eff_rush_ewm', 'last'),
+    #            eff_target_raw=('eff_target_ewm', 'last'),
+    #        )
+    #        .reset_index()
+    #    )
+#
+    #    # Shrink toward position means
+    #    player_agg['eff_pass']   = self._shrink(player_agg['eff_pass_raw'],   player_agg['total_games'], POSITION_MEAN_EFF['pass'])
+    #    player_agg['eff_rush']   = self._shrink(player_agg['eff_rush_raw'],   player_agg['total_games'], POSITION_MEAN_EFF['rush'])
+    #    player_agg['eff_target'] = self._shrink(player_agg['eff_target_raw'], player_agg['total_games'], POSITION_MEAN_EFF['target'])
+#
+    #    # ============================================================
+    #    # TEAM PASSING EFFICIENCY (for QB context)
+    #    # ============================================================
+    #    team_week_eff = (
+    #        hist_data.groupby(['team', 'week'])
+    #        .apply(lambda g: g['pass_points_earned'].sum() / max(g['pass_attempts'].sum(), 1))
+    #        .reset_index(name='team_pass_eff')
+    #    )
+    #    team_pass_eff = team_week_eff.groupby('team')['team_pass_eff'].mean().to_dict()
+#
+    #    #end here
+#
+    #    # ============================================================
+    #    # PER-POSITION LOOP
+    #    # ============================================================
+    #    player_records = []
+    #    for pos, span in self.core.POSITION_WINDOWS.items():
+    #        pos_df = hist_data[hist_data['position'] == pos].copy()
+    #        print(f"[Debug] position={pos}: {len(pos_df)} rows")
+    #        if pos_df.empty:
+    #            continue
+    #        
+    #        #pos_df['games_played'] = pos_df.groupby('player_id')['week'].transform('count')
+    #        pos_df['games_played'] = pos_df.groupby('player_id')['season_weight'].transform('sum')
+#
+    #        pos_df['base_pass_share']   = pos_df.groupby('player_id')['player_pass_share'].transform(lambda x: x.ewm(span=span, min_periods=1).mean())
+    #        pos_df['base_rush_share']   = pos_df.groupby('player_id')['player_rush_share'].transform(lambda x: x.ewm(span=span, min_periods=1).mean())
+    #        pos_df['base_target_share'] = pos_df.groupby('player_id')['player_target_share'].transform(lambda x: x.ewm(span=span, min_periods=1).mean())
+#
+    #        pos_df['pass_share_std']   = pos_df.groupby('player_id')['player_pass_share'].transform('std').fillna(0)
+    #        pos_df['rush_share_std']   = pos_df.groupby('player_id')['player_rush_share'].transform('std').fillna(0)
+    #        pos_df['target_share_std'] = pos_df.groupby('player_id')['player_target_share'].transform('std').fillna(0)
+#
+    #        latest = pos_df.groupby('player_id').last().reset_index()
+    #        latest = latest.merge(
+    #            player_agg[['player_id', 'eff_pass', 'eff_rush', 'eff_target']],
+    #            on='player_id', how='left'
+    #        )
+    #        latest['team_pass_eff'] = latest['team'].map(team_pass_eff).fillna(POSITION_MEAN_EFF['pass'])
+#
+    #        player_records.append(latest[[
+    #            'player_id', 'player_name', 'position', 'team',
+    #            'base_pass_share', 'base_rush_share', 'base_target_share',
+    #            'eff_pass', 'eff_rush', 'eff_target', 'team_pass_eff',
+    #            'pass_share_std', 'rush_share_std', 'target_share_std'
+    #        ]])
+#
+    #    if not player_records:
+    #        raise RuntimeError("player_records is empty.")
+#
+    #    df_players = pd.concat(player_records, ignore_index=True).rename(columns={'team': 'recent_team'})
+    #    print(f"[Debug] df_players rows: {len(df_players)}")
+#
+    #    TEAM_ALIASES = {
+    #        'LA': 'LAR', 'STL': 'LAR', 'SL': 'LAR',
+    #        'SD': 'LAC', 'OAK': 'LV', 'LVR': 'LV',
+    #        'WSH': 'WAS', 'JAC': 'JAX', 'ARZ': 'ARI',
+    #        'BLT': 'BAL', 'CLV': 'CLE', 'HST': 'HOU',
+    #    }
+    #    df_players['recent_team'] = df_players['recent_team'].replace(TEAM_ALIASES)
+    #    team_volumes = team_volumes.copy()
+    #    team_volumes['recent_team'] = team_volumes['recent_team'].replace(TEAM_ALIASES)
+#
+    #    for injured_name, details in injuries.items():
+    #        if injured_name in df_players['player_name'].values:
+    #            match = df_players[df_players['player_name'] == injured_name].iloc[0]
+    #            team = match['recent_team']
+    #            p_share = match['base_pass_share']
+    #            r_share = match['base_rush_share']
+    #            c_share = match['base_target_share']
+#
+    #            df_players.loc[df_players['player_name'] == injured_name,
+    #                           ['base_pass_share', 'base_rush_share', 'base_target_share']] = 0.0
+    #            team_mask = (df_players['recent_team'] == team) & (df_players['player_name'] != injured_name)
+#
+    #            if details['pos'] in ['WR', 'TE']:
+    #                df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_pass_share'] += p_share * 0.70
+    #                df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_pass_share'] += p_share * 0.30
+    #                df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_target_share'] += c_share * 0.70
+    #                df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_target_share'] += c_share * 0.30
+    #            elif details['pos'] == 'RB':
+    #                df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_rush_share'] += r_share * 0.80
+    #                df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_rush_share'] += r_share * 0.20
+    #                df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_target_share'] += c_share * 0.55
+    #                df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_target_share'] += c_share * 0.45
+#
+    #    merged = pd.merge(df_players, team_volumes, on='recent_team', how='left')
+#
+    #    defaults = {'proj_plays': 64.0, 'proj_team_pass': 38.4, 'proj_team_rec': 24.2,
+    #                'proj_team_rush': 25.6, 'implied_total': 22.0, 'completion_rate': 0.62}
+    #    for col, default in defaults.items():
+    #        if col in merged.columns:
+    #            merged[col] = merged[col].fillna(default)
+    #        else:
+    #            merged[col] = default
+#
+    #    if 'opponent_team' in merged.columns:
+    #        merged['opponent_team'] = merged['opponent_team'].fillna('UNK')
+    #    else:
+    #        merged['opponent_team'] = 'UNK'
+    #    if 'is_fav' in merged.columns:
+    #        merged['is_fav'] = merged['is_fav'].fillna(False)
+    #    else:
+    #        merged['is_fav'] = False
+#
+    #    # ============================================================
+    #    # BLEND TEAM EFFICIENCY INTO QB EFFICIENCY
+    #    # ============================================================
+    #    qb_mask = merged['position'] == 'QB'
+    #    merged.loc[qb_mask, 'eff_pass'] = (
+    #        0.5 * merged.loc[qb_mask, 'eff_pass']
+    #        + 0.5 * merged.loc[qb_mask, 'team_pass_eff']
+    #    )
+#
+    #    # Position-aware team-quality scaling
+    #    base_quality = (merged['implied_total'] / 22.0).clip(0.70, 1.40)
+    #    merged['team_quality_mod'] = np.where(
+    #        merged['position'] == 'QB',
+    #        base_quality ** 1.6,
+    #        np.where(
+    #            merged['position'].isin(['WR', 'TE']),
+    #            base_quality ** 1.4,
+    #            base_quality ** 1.1
+    #        )
+    #    )
+#
+    #    high_usage = (
+    #        (merged['position'].isin(['WR', 'TE']) & (merged['base_target_share'] >= 0.22)) |
+    #        ((merged['position'] == 'RB') & (merged['base_rush_share'] >= 0.55))
+    #    )
+    #    elite_pass_catcher = (
+    #        (merged['position'].isin(['WR', 'TE']) & (merged['base_target_share'] >= 0.25)) |
+    #        ((merged['position'] == 'RB') & (merged['base_target_share'] >= 0.15) & (merged['base_rush_share'] >= 0.55))
+    #    )
+#
+    #    merged['team_quality_mod'] = np.where(
+    #        high_usage,
+    #        np.maximum(merged['team_quality_mod'], 0.90),
+    #        merged['team_quality_mod']
+    #    )
+    #    merged['team_quality_mod'] = np.where(
+    #        elite_pass_catcher,
+    #        np.maximum(merged['team_quality_mod'], 0.95) * 1.05,
+    #        merged['team_quality_mod']
+    #    )
+#
+    #    merged['proj_pass_volume'] = merged['proj_team_pass'] * merged['base_pass_share'] * merged['team_quality_mod']
+    #    merged['proj_rush_volume'] = merged['proj_team_rush'] * merged['base_rush_share'] * merged['team_quality_mod']
+    #    merged['proj_team_targets'] = merged['proj_team_rec'] / merged['completion_rate'].replace(0, 0.62)
+    #    merged['proj_target_volume'] = merged['proj_team_targets'] * merged['base_target_share'] * merged['team_quality_mod']
+#
+    #    merged['raw_projection'] = (
+    #        merged['proj_pass_volume'] * merged['eff_pass']
+    #        + merged['proj_rush_volume'] * merged['eff_rush']
+    #        + merged['proj_target_volume'] * merged['eff_target']
+    #    )
+    #    print(f"[Debug] raw_projection range: {merged['raw_projection'].min():.2f}–{merged['raw_projection'].max():.2f}")
+#
+    #    def ceiling_multiplier(row):
+    #        pos = row['position']
+    #        if pos in ['WR', 'TE']:
+    #            share = row['base_target_share']
+    #            std   = row['target_share_std']
+    #            if share >= 0.28:   base = 1.55
+    #            elif share >= 0.22: base = 1.40
+    #            elif share >= 0.16: base = 1.25
+    #            elif share >= 0.10: base = 1.15
+    #            else:               base = 1.05
+    #            base += (0.15 - min(std, 0.15)) * 0.5
+    #        elif pos == 'RB':
+    #            rush = row['base_rush_share']
+    #            tgt  = row['base_target_share']
+    #            std  = row['rush_share_std']
+    #            if rush >= 0.60 and tgt >= 0.12: base = 1.50
+    #            elif rush >= 0.50:               base = 1.35
+    #            elif rush >= 0.35:               base = 1.22
+    #            elif rush >= 0.20:               base = 1.12
+    #            else:                            base = 1.02
+    #            base += (0.15 - min(std, 0.15)) * 0.5
+    #        elif pos == 'QB':
+    #            rush = row['base_rush_share']
+    #            if rush >= 0.15:   base = 1.45
+    #            elif rush >= 0.10: base = 1.32
+    #            elif rush >= 0.05: base = 1.22
+    #            else:              base = 1.12
+    #        else:
+    #            base = 1.15
+    #        return round(base, 3)
+#
+    #    merged['ceiling_multiplier'] = merged.apply(ceiling_multiplier, axis=1)
+    #    merged['ceiling_projection'] = (merged['raw_projection'] * merged['ceiling_multiplier']).round(2)
+#
+    #    def stability_score(row):
+    #        if row['position'] in ['WR', 'TE']:
+    #            std = row['target_share_std']
+    #        elif row['position'] == 'RB':
+    #            std = (row['rush_share_std'] + row['target_share_std']) / 2
+    #        else:
+    #            std = row['pass_share_std']
+    #        return round(max(0.0, 1.0 - min(std, 0.25) / 0.25), 3)
+#
+    #    merged['usage_stability'] = merged.apply(stability_score, axis=1)
+    #    print(f"[Debug] ceiling_projection range: {merged['ceiling_projection'].min():.2f}–{merged['ceiling_projection'].max():.2f}")
+    #    return merged
 
     #def allocate_and_synthesize(self, team_volumes, injured_players=None):
     #    print("[Pipeline] Computing micro volume market shares...")
@@ -489,6 +581,307 @@ class DKProjectionPipeline:
     #    print(f"[Debug] ceiling_projection range: {merged['ceiling_projection'].min():.2f}–{merged['ceiling_projection'].max():.2f}")
     #    return merged
 
+    def allocate_and_synthesize(self, team_volumes, injured_players=None):
+        print("[Pipeline] Computing micro volume market shares...")
+        sort_cols = ['player_id']
+        if 'season' in self.core.master_weekly.columns:
+            sort_cols.append('season')
+        sort_cols.append('week')
+        hist_data = self.core.master_weekly.copy().sort_values(by=sort_cols)
+        injuries = injured_players if injured_players else {}
+
+        if hist_data.empty:
+            raise RuntimeError("hist_data is empty.")
+
+        hist_data['player_pass_share']   = (hist_data['pass_attempts'] / hist_data['team_pass_attempts']).fillna(0.0).clip(0, 1)
+        hist_data['player_rush_share']   = (hist_data['rush_attempts'] / hist_data['team_rush_attempts']).fillna(0.0).clip(0, 1)
+        hist_data['player_target_share'] = (hist_data['targets']       / hist_data['team_targets']).fillna(0.0).clip(0, 1)
+
+        rec_points_earned  = hist_data['receptions'] * 1.0 + hist_data['receiving_yards'] * 0.1 + hist_data['receiving_tds'] * 6.0
+        rush_points_earned = hist_data['rushing_yards'] * 0.1 + hist_data['rushing_tds'] * 6.0
+        pass_points_earned = (hist_data['passing_yards'] * 0.04
+                              + hist_data['passing_tds'] * 4.0
+                              - hist_data['passing_interceptions'] * 1.0)
+        fumbles = (hist_data['sack_fumbles_lost']
+                   + hist_data['rushing_fumbles_lost']
+                   + hist_data['receiving_fumbles_lost'])
+
+        hist_data['rec_points_earned']  = rec_points_earned
+        hist_data['rush_points_earned'] = rush_points_earned - fumbles * 2.0
+        hist_data['pass_points_earned'] = pass_points_earned
+
+        # ============================================================
+        # PER-GAME EFFICIENCY, EWM-WEIGHTED
+        # ============================================================
+        hist_data['game_pts_per_pass_att'] = (
+            hist_data['pass_points_earned'] / hist_data['pass_attempts'].replace(0, np.nan)
+        ).fillna(0)
+        hist_data['game_pts_per_rush_att'] = (
+            hist_data['rush_points_earned'] / hist_data['rush_attempts'].replace(0, np.nan)
+        ).fillna(0)
+        hist_data['game_pts_per_target'] = (
+            (hist_data['receptions'] * 1.0
+             + hist_data['receiving_yards'] * 0.1
+             + hist_data['receiving_tds'] * 6.0)
+            / hist_data['targets'].replace(0, np.nan)
+        ).fillna(0)
+
+        # Debug: Lamb's per-game efficiency in the raw data
+        lamb_games = hist_data[hist_data['player_name'] == 'CeeDee Lamb'].tail(8)
+        if not lamb_games.empty:
+            print(f"[DEBUG LAMB GAMES] (last 8 rows after sort):")
+            print(lamb_games[['season', 'week', 'targets', 'receptions', 'receiving_yards',
+                              'receiving_tds', 'game_pts_per_target']].to_string())
+
+        def ewm_eff(col, span):
+            return hist_data.groupby('player_id')[col].transform(
+                lambda x: x.ewm(span=span, min_periods=1).mean()
+            )
+
+        hist_data['eff_pass_ewm']   = ewm_eff('game_pts_per_pass_att', self.core.POSITION_WINDOWS['QB'])
+        hist_data['eff_rush_ewm']   = ewm_eff('game_pts_per_rush_att', self.core.POSITION_WINDOWS['RB'])
+        hist_data['eff_target_ewm'] = ewm_eff('game_pts_per_target',   self.core.POSITION_WINDOWS['WR'])
+
+        player_agg = (
+            hist_data
+            .sort_values(['player_id', 'season', 'week'])
+            .groupby('player_id')
+            .agg(
+                total_games=('season_weight', 'sum'),
+                eff_pass_raw=('eff_pass_ewm', 'last'),
+                eff_rush_raw=('eff_rush_ewm', 'last'),
+                eff_target_raw=('eff_target_ewm', 'last'),
+            )
+            .reset_index()
+        )
+
+        # Debug: Lamb's pre-shrink efficiency
+        lamb_ids = hist_data[hist_data['player_name'] == 'CeeDee Lamb']['player_id'].unique()
+        lamb_agg = player_agg[player_agg['player_id'].isin(lamb_ids)]
+        if not lamb_agg.empty:
+            r = lamb_agg.iloc[0]
+            print(f"[DEBUG LAMB AGG] eff_target_raw={r['eff_target_raw']:.3f}, "
+                  f"total_games={r['total_games']:.2f}")
+
+        player_agg['eff_pass']   = self._shrink(player_agg['eff_pass_raw'],   player_agg['total_games'], POSITION_MEAN_EFF['pass'])
+        player_agg['eff_rush']   = self._shrink(player_agg['eff_rush_raw'],   player_agg['total_games'], POSITION_MEAN_EFF['rush'])
+        player_agg['eff_target'] = self._shrink(player_agg['eff_target_raw'], player_agg['total_games'], POSITION_MEAN_EFF['target'])
+
+        # Debug: Lamb's post-shrink efficiency
+        lamb_agg_post = player_agg[player_agg['player_id'].isin(lamb_ids)]
+        if not lamb_agg_post.empty:
+            r = lamb_agg_post.iloc[0]
+            print(f"[DEBUG LAMB AGG POST-SHRINK] eff_target={r['eff_target']:.3f}")
+
+        # ============================================================
+        # TEAM PASSING EFFICIENCY
+        # ============================================================
+        team_week_eff = (
+            hist_data.groupby(['team', 'week'])
+            .apply(lambda g: g['pass_points_earned'].sum() / max(g['pass_attempts'].sum(), 1))
+            .reset_index(name='team_pass_eff')
+        )
+        team_pass_eff = team_week_eff.groupby('team')['team_pass_eff'].mean().to_dict()
+
+        # ============================================================
+        # PER-POSITION LOOP
+        # ============================================================
+        player_records = []
+        for pos, span in self.core.POSITION_WINDOWS.items():
+            pos_df = hist_data[hist_data['position'] == pos].copy()
+            print(f"[Debug] position={pos}: {len(pos_df)} rows")
+            if pos_df.empty:
+                continue
+
+            pos_df['games_played'] = pos_df.groupby('player_id')['season_weight'].transform('sum')
+
+            pos_df['base_pass_share']   = pos_df.groupby('player_id')['player_pass_share'].transform(lambda x: x.ewm(span=span, min_periods=1).mean())
+            pos_df['base_rush_share']   = pos_df.groupby('player_id')['player_rush_share'].transform(lambda x: x.ewm(span=span, min_periods=1).mean())
+            pos_df['base_target_share'] = pos_df.groupby('player_id')['player_target_share'].transform(lambda x: x.ewm(span=span, min_periods=1).mean())
+
+            pos_df['pass_share_std']   = pos_df.groupby('player_id')['player_pass_share'].transform('std').fillna(0)
+            pos_df['rush_share_std']   = pos_df.groupby('player_id')['player_rush_share'].transform('std').fillna(0)
+            pos_df['target_share_std'] = pos_df.groupby('player_id')['player_target_share'].transform('std').fillna(0)
+
+            latest = pos_df.groupby('player_id').last().reset_index()
+            latest = latest.merge(
+                player_agg[['player_id', 'eff_pass', 'eff_rush', 'eff_target']],
+                on='player_id', how='left'
+            )
+            latest['team_pass_eff'] = latest['team'].map(team_pass_eff).fillna(POSITION_MEAN_EFF['pass'])
+
+            player_records.append(latest[[
+                'player_id', 'player_name', 'position', 'team',
+                'base_pass_share', 'base_rush_share', 'base_target_share',
+                'eff_pass', 'eff_rush', 'eff_target', 'team_pass_eff',
+                'pass_share_std', 'rush_share_std', 'target_share_std'
+            ]])
+
+        if not player_records:
+            raise RuntimeError("player_records is empty.")
+
+        df_players = pd.concat(player_records, ignore_index=True).rename(columns={'team': 'recent_team'})
+        print(f"[Debug] df_players rows: {len(df_players)}")
+
+        TEAM_ALIASES = {
+            'LA': 'LAR', 'STL': 'LAR', 'SL': 'LAR',
+            'SD': 'LAC', 'OAK': 'LV', 'LVR': 'LV',
+            'WSH': 'WAS', 'JAC': 'JAX', 'ARZ': 'ARI',
+            'BLT': 'BAL', 'CLV': 'CLE', 'HST': 'HOU',
+        }
+        df_players['recent_team'] = df_players['recent_team'].replace(TEAM_ALIASES)
+        team_volumes = team_volumes.copy()
+        team_volumes['recent_team'] = team_volumes['recent_team'].replace(TEAM_ALIASES)
+
+        for injured_name, details in injuries.items():
+            if injured_name in df_players['player_name'].values:
+                match = df_players[df_players['player_name'] == injured_name].iloc[0]
+                team = match['recent_team']
+                p_share = match['base_pass_share']
+                r_share = match['base_rush_share']
+                c_share = match['base_target_share']
+
+                df_players.loc[df_players['player_name'] == injured_name,
+                               ['base_pass_share', 'base_rush_share', 'base_target_share']] = 0.0
+                team_mask = (df_players['recent_team'] == team) & (df_players['player_name'] != injured_name)
+
+                if details['pos'] in ['WR', 'TE']:
+                    df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_pass_share'] += p_share * 0.70
+                    df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_pass_share'] += p_share * 0.30
+                    df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_target_share'] += c_share * 0.70
+                    df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_target_share'] += c_share * 0.30
+                elif details['pos'] == 'RB':
+                    df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_rush_share'] += r_share * 0.80
+                    df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_rush_share'] += r_share * 0.20
+                    df_players.loc[team_mask & df_players['position'].isin(['WR', 'TE']), 'base_target_share'] += c_share * 0.55
+                    df_players.loc[team_mask & (df_players['position'] == 'RB'), 'base_target_share'] += c_share * 0.45
+
+        merged = pd.merge(df_players, team_volumes, on='recent_team', how='left')
+
+        defaults = {'proj_plays': 64.0, 'proj_team_pass': 38.4, 'proj_team_rec': 24.2,
+                    'proj_team_rush': 25.6, 'implied_total': 22.0, 'completion_rate': 0.62}
+        for col, default in defaults.items():
+            if col in merged.columns:
+                merged[col] = merged[col].fillna(default)
+            else:
+                merged[col] = default
+
+        if 'opponent_team' in merged.columns:
+            merged['opponent_team'] = merged['opponent_team'].fillna('UNK')
+        else:
+            merged['opponent_team'] = 'UNK'
+        if 'is_fav' in merged.columns:
+            merged['is_fav'] = merged['is_fav'].fillna(False)
+        else:
+            merged['is_fav'] = False
+
+        qb_mask = merged['position'] == 'QB'
+        merged.loc[qb_mask, 'eff_pass'] = (
+            0.5 * merged.loc[qb_mask, 'eff_pass']
+            + 0.5 * merged.loc[qb_mask, 'team_pass_eff']
+        )
+
+        base_quality = (merged['implied_total'] / 22.0).clip(0.70, 1.40)
+        merged['team_quality_mod'] = np.where(
+            merged['position'] == 'QB',
+            base_quality ** 1.6,
+            np.where(
+                merged['position'].isin(['WR', 'TE']),
+                base_quality ** 1.4,
+                base_quality ** 1.1
+            )
+        )
+
+        high_usage = (
+            (merged['position'].isin(['WR', 'TE']) & (merged['base_target_share'] >= 0.22)) |
+            ((merged['position'] == 'RB') & (merged['base_rush_share'] >= 0.55))
+        )
+        elite_pass_catcher = (
+            (merged['position'].isin(['WR', 'TE']) & (merged['base_target_share'] >= 0.25)) |
+            ((merged['position'] == 'RB') & (merged['base_target_share'] >= 0.15) & (merged['base_rush_share'] >= 0.55))
+        )
+
+        merged['team_quality_mod'] = np.where(
+            high_usage,
+            np.maximum(merged['team_quality_mod'], 0.90),
+            merged['team_quality_mod']
+        )
+        merged['team_quality_mod'] = np.where(
+            elite_pass_catcher,
+            np.maximum(merged['team_quality_mod'], 0.95) * 1.05,
+            merged['team_quality_mod']
+        )
+
+        merged['proj_pass_volume'] = merged['proj_team_pass'] * merged['base_pass_share'] * merged['team_quality_mod']
+        merged['proj_rush_volume'] = merged['proj_team_rush'] * merged['base_rush_share'] * merged['team_quality_mod']
+        merged['proj_team_targets'] = merged['proj_team_rec'] / merged['completion_rate'].replace(0, 0.62)
+        merged['proj_target_volume'] = merged['proj_team_targets'] * merged['base_target_share'] * merged['team_quality_mod']
+
+        merged['raw_projection'] = (
+            merged['proj_pass_volume'] * merged['eff_pass']
+            + merged['proj_rush_volume'] * merged['eff_rush']
+            + merged['proj_target_volume'] * merged['eff_target']
+        )
+
+        # Debug: Lamb's final values before ceiling
+        lamb_merged = merged[merged['player_name'] == 'CeeDee Lamb']
+        if not lamb_merged.empty:
+            r = lamb_merged.iloc[0]
+            print(f"[DEBUG LAMB MERGED] base_target_share={r['base_target_share']:.3f}, "
+                  f"proj_target_volume={r['proj_target_volume']:.2f}, "
+                  f"eff_target={r['eff_target']:.3f}, "
+                  f"team_quality_mod={r['team_quality_mod']:.3f}, "
+                  f"raw_projection={r['raw_projection']:.2f}")
+
+        print(f"[Debug] raw_projection range: {merged['raw_projection'].min():.2f}–{merged['raw_projection'].max():.2f}")
+
+        def ceiling_multiplier(row):
+            pos = row['position']
+            if pos in ['WR', 'TE']:
+                share = row['base_target_share']
+                std   = row['target_share_std']
+                if share >= 0.28:   base = 1.55
+                elif share >= 0.22: base = 1.40
+                elif share >= 0.16: base = 1.25
+                elif share >= 0.10: base = 1.15
+                else:               base = 1.05
+                base += (0.15 - min(std, 0.15)) * 0.5
+            elif pos == 'RB':
+                rush = row['base_rush_share']
+                tgt  = row['base_target_share']
+                std  = row['rush_share_std']
+                if rush >= 0.60 and tgt >= 0.12: base = 1.50
+                elif rush >= 0.50:               base = 1.35
+                elif rush >= 0.35:               base = 1.22
+                elif rush >= 0.20:               base = 1.12
+                else:                            base = 1.02
+                base += (0.15 - min(std, 0.15)) * 0.5
+            elif pos == 'QB':
+                rush = row['base_rush_share']
+                if rush >= 0.15:   base = 1.45
+                elif rush >= 0.10: base = 1.32
+                elif rush >= 0.05: base = 1.22
+                else:              base = 1.12
+            else:
+                base = 1.15
+            return round(base, 3)
+
+        merged['ceiling_multiplier'] = merged.apply(ceiling_multiplier, axis=1)
+        merged['ceiling_projection'] = (merged['raw_projection'] * merged['ceiling_multiplier']).round(2)
+
+        def stability_score(row):
+            if row['position'] in ['WR', 'TE']:
+                std = row['target_share_std']
+            elif row['position'] == 'RB':
+                std = (row['rush_share_std'] + row['target_share_std']) / 2
+            else:
+                std = row['pass_share_std']
+            return round(max(0.0, 1.0 - min(std, 0.25) / 0.25), 3)
+
+        merged['usage_stability'] = merged.apply(stability_score, axis=1)
+        print(f"[Debug] ceiling_projection range: {merged['ceiling_projection'].min():.2f}–{merged['ceiling_projection'].max():.2f}")
+        return merged
+
     def run_full_pipeline(self, injured_players_dict=None):
         self.core.fetch_and_clean_data()
         dvp_matrix = self.core.calculate_matchup_dvp()
@@ -503,6 +896,17 @@ class DKProjectionPipeline:
             right_on=['defense_team', 'position'],
             how='left'
         ).fillna({'dvp_multiplier': 1.0})
+        
+        # Debug specific players
+        for name in ['CeeDee Lamb', 'George Pickens', 'Dak Prescott']:
+            match = final_df[final_df['player_name'] == name]
+            if not match.empty:
+                r = match.iloc[0]
+                print(f"[DEBUG] {name}: share={r['base_target_share']:.3f}, "
+                      f"eff_target={r['eff_target']:.3f}, "
+                      f"proj_target_vol={r['proj_target_volume']:.2f}, "
+                      f"raw_proj={r['raw_projection']:.2f}, "
+                      f"team={r['recent_team']}")
 
         final_df = final_df[final_df['opponent_team'] != 'UNK'].copy()
         print(f"[Debug] after bye filter: {len(final_df)} rows")

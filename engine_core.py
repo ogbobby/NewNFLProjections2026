@@ -8,7 +8,7 @@ class DKCoreDataEngine:
         self.stats_season = stats_season
         self.target_season = target_season
         self.week = target_week
-        self.POSITION_WINDOWS = {'QB': 6, 'RB': 6, 'WR': 3, 'TE': 3}
+        self.POSITION_WINDOWS = {'QB': 6, 'RB': 6, 'WR': 6, 'TE': 3} #WR was 3
         self.master_weekly = None
         self.schedule = None
         self.dk_salary_csv = None
@@ -96,6 +96,12 @@ class DKCoreDataEngine:
         # Load two prior seasons so injured players have enough sample for shrinkage
         seasons_to_load = [self.stats_season - 1, self.stats_season]
         print(f"[Core] Loading stats from seasons {seasons_to_load}")
+        #weekly_raw = nflreadpy.load_player_stats(seasons_to_load)
+        # Load 2024, 2025, and 2026 (if target_season is 2026)
+        seasons_to_load = [self.stats_season - 1, self.stats_season]
+        if self.target_season not in seasons_to_load:
+            seasons_to_load.append(self.target_season)
+        print(f"[Core] Loading stats from seasons {seasons_to_load}")
         weekly_raw = nflreadpy.load_player_stats(seasons_to_load)
         try:
             schedule_raw = nflreadpy.load_schedules([self.target_season])
@@ -105,6 +111,51 @@ class DKCoreDataEngine:
         self.master_weekly = weekly_raw.to_pandas() if hasattr(weekly_raw, "to_pandas") else pd.DataFrame(weekly_raw)
         self.schedule = schedule_raw.to_pandas() if hasattr(schedule_raw, "to_pandas") else pd.DataFrame(schedule_raw)
         df = self.master_weekly
+        #adding season weights
+        #if 'season' in df.columns:
+        #    max_season = df['season'].max()
+        #    # Default weights: for 3 seasons, [0.15, 0.35, 0.50]
+        #    # For 2 seasons, [0.35, 0.65]
+        #    unique_seasons = sorted(df['season'].unique())
+        #    n_seasons = len(unique_seasons)
+        #    if n_seasons == 3:
+        #        weight_map = {unique_seasons[0]: 0.15, unique_seasons[1]: 0.35, unique_seasons[2]: 0.50}
+        #    elif n_seasons == 2:
+        #        weight_map = {unique_seasons[0]: 0.35, unique_seasons[1]: 0.65}
+        #    else:
+        #        weight_map = {unique_seasons[0]: 1.0}
+        #    df['season_weight'] = df['season'].map(weight_map)
+        #    print(f"[Core] Season weights: {weight_map}")
+        if 'season' in df.columns:
+            unique_seasons = sorted(df['season'].unique())
+            max_season = unique_seasons[-1]
+
+            # Scale 2026 weight based on how much of the season has elapsed
+            weeks_elapsed = max(self.week - 1, 0)
+            total_weeks = 18.0
+            season_progress = weeks_elapsed / total_weeks
+
+            weight_current = min(0.75 * season_progress, 0.75)
+            weight_prior = max(0.75 - weight_current * 0.5, 0.35)
+            weight_oldest = max(1.0 - weight_current - weight_prior, 0.0)
+
+            if len(unique_seasons) == 3:
+                weight_map = {
+                    unique_seasons[0]: weight_oldest,
+                    unique_seasons[1]: weight_prior,
+                    unique_seasons[2]: weight_current,
+                }
+            elif len(unique_seasons) == 2:
+                weight_map = {
+                    unique_seasons[0]: max(1.0 - weight_current, 0.3),
+                    unique_seasons[1]: weight_current,
+                }
+            else:
+                weight_map = {unique_seasons[0]: 1.0}
+
+            df['season_weight'] = df['season'].map(weight_map)
+            print(f"[Core] Season weights: {weight_map}")
+            
         df = df[df['position'].isin(['QB', 'RB', 'WR', 'TE'])].copy()
         # --- Full display name for joins against DK ---
         if 'player_display_name' in df.columns:
@@ -382,17 +433,34 @@ class DKCoreDataEngine:
         hist = self.master_weekly.copy()
         # Use historical_team here: we want to know how many plays each 2025 offense
         # ran, not how many 2026 teams' combined rosters ran in 2025.
-        team_games = (hist.groupby(['historical_team', 'week'])
-                      .agg(pass_att=('pass_attempts', 'sum'),
-                           receptions=('receptions', 'sum'),
-                           rush_att=('rush_attempts', 'sum'))
-                      .reset_index())
-        #hist = self.master_weekly.copy()
-        #team_games = (hist.groupby(['team', 'week'])
+        #team_games = (hist.groupby(['historical_team', 'week'])
         #              .agg(pass_att=('pass_attempts', 'sum'),
         #                   receptions=('receptions', 'sum'),
         #                   rush_att=('rush_attempts', 'sum'))
         #              .reset_index())
+        group_cols = ['historical_team']
+        if 'season' in hist.columns:
+            group_cols.append('season')
+        group_cols.append('week')
+
+        #team_games = (hist.groupby(group_cols)
+        #              .agg(pass_att=('pass_attempts', 'sum'),
+        #                   receptions=('receptions', 'sum'),
+        #                   rush_att=('rush_attempts', 'sum'))
+        #              .reset_index())
+        
+        hist = self.master_weekly.copy()
+        if 'season' in hist.columns:
+            group_cols = ['historical_team', 'season', 'week']
+        else:
+            group_cols = ['historical_team', 'week']
+
+        team_games = (hist.groupby(group_cols)
+                      .agg(pass_att=('pass_attempts', 'sum'),
+                           receptions=('receptions', 'sum'),
+                           rush_att=('rush_attempts', 'sum'))
+                      .reset_index())
+
         team_games['plays'] = team_games['pass_att'] + team_games['rush_att']
         team_games['pass_rate'] = team_games['pass_att'] / team_games['plays'].replace(0, pd.NA)
         team_games['completion_rate'] = team_games['receptions'] / team_games['pass_att'].replace(0, pd.NA)

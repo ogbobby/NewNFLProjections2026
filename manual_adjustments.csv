@@ -1,7 +1,37 @@
-player_name,projection_mult,ceiling_mult,force_include,fade,notes
-Kenny Gainwell,0.65,0.65,false,true,RB2 behind Bucky
-Kyler Murray,0.55,0.55,false,true,hes hurt and will be out for a while
-Kevin Austin Jr.,0.00,0.00,false,true,he stinks
-Jake Tonges,0.00,0.00,false,true,Out for year
-Sincere McCormick,0.00,0.00,false,true,hes trash
-Josh Jacobs,0.00,0.00,false,true,suspended
+player_name,projection_mult,ceiling_mult,projection_override,force_include,fade,notes
+Kenny Gainwell,0.0,0.0,,false,true,RB2 behind Bucky
+Kevin Austin Jr.,0.00,0.00,,false,true,he stinks
+Jake Tonges,0.00,0.00,,false,true,Out for year
+Sincere McCormick,0.00,0.00,,false,true,hes trash
+Josh Jacobs,0.00,0.00,,false,true,suspended
+Zay Flowers,0.00,0.00,,false,true,Just got Ruled Out
+Nico Collins,0.00,0.00,,false,true,Just Got Ruled Out
+Foster Moreau,0.00,0.00,,false,true,he sucks
+DJ Moore,0.00,0.00,,false,true,out
+Jaxson Dart,0.00,0.00,,false,true,out
+David Njoku,0.00,0.00,,false,true,out
+Jayden Reed,0.00,0.00,,false,true,out
+Gunner Olszewski,0.00,0.00,,false,true,out
+Theo Johnson,0.00,0.00,,false,true,out
+Oronde Gadsden II,1.0,1.0,12.0,false,false,All LAC te are hurt
+Wan'Dale Robinson,0.00,0.00,,false,true,hes just not that good
+Quinshon Judkins,0.00,0.00,,false,true,hes just not that good
+Rhamondre Stevenson,0.00,0.00,,false,true,hes just not that good 
+Mason Taylor,0.00,0.00,,false,true,hes out
+Kenyon Sadiq,1.0,1.0,12.0,false,false,reg starter is hurt he might be a beast in a great spot  
+Brenton Strange,0.00,0.00,,false,true,projection is to high 
+Travis Etienne Jr.,0.00,0.00,,false,true,Hes not startable right now
+Rico Dowdle,0.00,0.00,,false,true,hes hurt
+Woody Marks,0.00,0.00,,false,true,hes not good and splitting with Monty
+Jerry Jeudy,0.00,0.00,11.2,false,true,hes so bad
+Devontez Walker,0.00,0.00,,false,true,Projections are to high
+Alec Pierce,0.00,0.00,,false,true,Hes out
+Jayden Daniels,0.00,0.00,,false,true,Hes out
+A.J. Brown,0.00,0.00,,false,true,Hes on IR
+Caleb Williams,0.00,0.00,,false,true,Hes on OUT
+J.K. Dobbins,0.00,0.00,,false,true,Hes not good 
+Breece Hall,0.00,0.00,,false,true,Hes Hurt not sure if hes playing
+De'Von Achane,0.00,0.00,,false,true,Out for the year
+Justin Jefferson,0.00,0.00,,false,true,Hes out
+Dalton Schultz,1.0,1.0,14.0,false,false,HOU TE undervalued by model
+Davonta Smith,0.00,0.00,,false,true,Hes out

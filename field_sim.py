@@ -68,10 +68,31 @@ def infer_slate_teams(dk_salary_path):
 # ============================================================
 def load_projections(path, pool_size_mult=1.0, only_teams=None, top_pct=None):
     df = pd.read_csv(path)
-    required = ['Name', 'Position', 'Team', 'Salary', 'Fpts', 'Own%', 'StdDev']
+
+    # Normalize column names — accept the pipeline schema or the field_sim schema
+    column_aliases = {
+        'Player': 'Name',
+        'Projection': 'Fpts',
+        'Ownership': 'Own%',
+        'Opponent': 'Opp',
+        'AvgPointsPerGame': 'AvgPPG',
+    }
+    for old, new in column_aliases.items():
+        if old in df.columns and new not in df.columns:
+            df = df.rename(columns={old: new})
+
+    # Ownership scale — pipeline writes fractions (0.15), field_sim may expect percent (15.0)
+    if 'Own%' in df.columns and df['Own%'].max() <= 1.0:
+        df['Own%'] = df['Own%'] * 100
+
+    required = ['Name', 'Position', 'Team', 'Salary', 'Fpts', 'StdDev']
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"Projections CSV missing: {missing}")
+        raise ValueError(f"Projections CSV missing: {missing}\nAvailable: {df.columns.tolist()}")
+
+    # Own% is optional — fill with a default if missing
+    if 'Own%' not in df.columns:
+        df['Own%'] = 5.0  # neutral default
 
     df = df[df['Position'].isin(['QB', 'RB', 'WR', 'TE', 'DST'])].copy()
     df['Salary'] = pd.to_numeric(df['Salary'], errors='coerce').fillna(0).astype(int)
@@ -79,56 +100,87 @@ def load_projections(path, pool_size_mult=1.0, only_teams=None, top_pct=None):
     df['StdDev'] = pd.to_numeric(df['StdDev'], errors='coerce').fillna(5.0)
     df['Own%'] = pd.to_numeric(df['Own%'], errors='coerce').fillna(0)
 
-    # --- FIX 1: Rescale DST projections if compressed ---
+    # DST projection rescale (if compressed)
     dst_mask = df['Position'] == 'DST'
     if dst_mask.any():
         dst_df = df[dst_mask]
         old_min, old_max = dst_df['Fpts'].min(), dst_df['Fpts'].max()
-        if old_max - old_min > 0 and old_max < DST_PROJ_MAX - 1.0:
+        if old_max - old_min > 0 and old_max < 10.0:
             df.loc[dst_mask, 'Fpts'] = (
-                DST_PROJ_MIN + (dst_df['Fpts'] - old_min) *
-                (DST_PROJ_MAX - DST_PROJ_MIN) / (old_max - old_min)
+                3.0 + (dst_df['Fpts'] - old_min) * (11.0 - 3.0) / (old_max - old_min)
             ).round(2)
-            print(f"[Fix DST] Rescaled projections to [{DST_PROJ_MIN}, {DST_PROJ_MAX}]")
 
-    # --- FIX 2: Synthesize DST salaries if all identical ---
-    if dst_mask.any() and df.loc[dst_mask, 'Salary'].nunique() == 1:
-        dst_df = df[dst_mask].copy()
-        rank = dst_df['Fpts'].rank(pct=True)
-        dst_df['Salary'] = (DST_SALARY_MIN + (DST_SALARY_MAX - DST_SALARY_MIN) * rank).round(-1).astype(int)
-        df.loc[dst_mask, 'Salary'] = dst_df['Salary']
-        print(f"[Fix DST] Synthesized salaries ${DST_SALARY_MIN}-${DST_SALARY_MAX}")
-
-    # Slate filter
     if only_teams:
-        before = len(df)
         df = df[df['Team'].isin(only_teams)].copy()
-        print(f"[Slate] {before} -> {len(df)} players")
-
-    # Percentile floor (scale-free)
-    if top_pct is not None:
-        def pct_filter(group):
-            if len(group) < 3:
-                return group
-            threshold = group['Fpts'].quantile(1 - top_pct)
-            return group[group['Fpts'] >= threshold]
-        before = len(df)
-        df = df.groupby('Position', group_keys=False).apply(pct_filter).reset_index(drop=True)
-        print(f"[Floor] Top {top_pct*100:.0f}% per position -> {before} -> {len(df)} players")
 
     df = df[df['Salary'] > 0].copy()
     df['_key'] = df['Name'].map(norm_name)
     df = df.drop_duplicates('_key').reset_index(drop=True)
 
-    # Position pool filter (top N by a blend of projection + ownership)
-    def filt(group):
-        n = int(POOL_SIZES.get(group.name, 30) * pool_size_mult)
-        group = group.copy()
-        group['_rank_score'] = group['Fpts'].rank(ascending=False) + group['Own%'].rank(ascending=False)
-        return group.nsmallest(n, '_rank_score')
-
-    df = df.groupby('Position', group_keys=False).apply(filt).reset_index(drop=True)
     return df
+#def load_projections(path, pool_size_mult=1.0, only_teams=None, top_pct=None):
+#    df = pd.read_csv(path)
+#    required = ['Name', 'Position', 'Team', 'Salary', 'Fpts', 'Own%', 'StdDev']
+#    missing = [c for c in required if c not in df.columns]
+#    if missing:
+#        raise ValueError(f"Projections CSV missing: {missing}")
+#
+#    df = df[df['Position'].isin(['QB', 'RB', 'WR', 'TE', 'DST'])].copy()
+#    df['Salary'] = pd.to_numeric(df['Salary'], errors='coerce').fillna(0).astype(int)
+#    df['Fpts'] = pd.to_numeric(df['Fpts'], errors='coerce').fillna(0)
+#    df['StdDev'] = pd.to_numeric(df['StdDev'], errors='coerce').fillna(5.0)
+#    df['Own%'] = pd.to_numeric(df['Own%'], errors='coerce').fillna(0)
+#
+#    # --- FIX 1: Rescale DST projections if compressed ---
+#    dst_mask = df['Position'] == 'DST'
+#    if dst_mask.any():
+#        dst_df = df[dst_mask]
+#        old_min, old_max = dst_df['Fpts'].min(), dst_df['Fpts'].max()
+#        if old_max - old_min > 0 and old_max < DST_PROJ_MAX - 1.0:
+#            df.loc[dst_mask, 'Fpts'] = (
+#                DST_PROJ_MIN + (dst_df['Fpts'] - old_min) *
+#                (DST_PROJ_MAX - DST_PROJ_MIN) / (old_max - old_min)
+#            ).round(2)
+#            print(f"[Fix DST] Rescaled projections to [{DST_PROJ_MIN}, {DST_PROJ_MAX}]")
+#
+#    # --- FIX 2: Synthesize DST salaries if all identical ---
+#    if dst_mask.any() and df.loc[dst_mask, 'Salary'].nunique() == 1:
+#        dst_df = df[dst_mask].copy()
+#        rank = dst_df['Fpts'].rank(pct=True)
+#        dst_df['Salary'] = (DST_SALARY_MIN + (DST_SALARY_MAX - DST_SALARY_MIN) * rank).round(-1).astype(int)
+#        df.loc[dst_mask, 'Salary'] = dst_df['Salary']
+#        print(f"[Fix DST] Synthesized salaries ${DST_SALARY_MIN}-${DST_SALARY_MAX}")
+#
+#    # Slate filter
+#    if only_teams:
+#        before = len(df)
+#        df = df[df['Team'].isin(only_teams)].copy()
+#        print(f"[Slate] {before} -> {len(df)} players")
+#
+#    # Percentile floor (scale-free)
+#    if top_pct is not None:
+#        def pct_filter(group):
+#            if len(group) < 3:
+#                return group
+#            threshold = group['Fpts'].quantile(1 - top_pct)
+#            return group[group['Fpts'] >= threshold]
+#        before = len(df)
+#        df = df.groupby('Position', group_keys=False).apply(pct_filter).reset_index(drop=True)
+#        print(f"[Floor] Top {top_pct*100:.0f}% per position -> {before} -> {len(df)} players")
+#
+#    df = df[df['Salary'] > 0].copy()
+#    df['_key'] = df['Name'].map(norm_name)
+#    df = df.drop_duplicates('_key').reset_index(drop=True)
+#
+#    # Position pool filter (top N by a blend of projection + ownership)
+#    def filt(group):
+#        n = int(POOL_SIZES.get(group.name, 30) * pool_size_mult)
+#        group = group.copy()
+#        group['_rank_score'] = group['Fpts'].rank(ascending=False) + group['Own%'].rank(ascending=False)
+#        return group.nsmallest(n, '_rank_score')
+#
+#    df = df.groupby('Position', group_keys=False).apply(filt).reset_index(drop=True)
+#    return df
 
 
 # ============================================================
@@ -409,34 +461,77 @@ class LineupOptimizer:
 # Simulation and grading — unchanged
 # ============================================================
 def simulate_field(proj, field_lineup_ids, iterations, seed=42):
+    """
+    Simulate weekly outcomes for a set of lineups using correlated sampling.
+
+    Three levels of correlation:
+      1. Player-level noise (base)
+      2. Team-level shock (same-team players move together)
+      3. Game-level shock (both teams in a shootout move together)
+
+    This makes stack lineups appropriately volatile.
+    """
     rng = np.random.default_rng(seed)
     n_players = len(proj)
+
     means = proj['Fpts'].values
     stds = proj['StdDev'].values
-    stds = np.clip(stds, np.maximum(means * 0.25, 1.0), np.maximum(means * 0.75, 3.0))
+    # Widened StdDev clip — real NFL weekly variance is higher than [0.30, 0.55]
+    stds = np.clip(
+        stds,
+        np.maximum(means * 0.40, 1.0),
+        np.maximum(means * 0.75, 3.0)
+    )
+
     teams = proj['Team'].values
     positions = proj['Position'].values
+
+    # Build opponent map from the 'Opp' column if present, else fall back to team-only
+    if 'Opp' in proj.columns:
+        opponents = proj['Opp'].fillna('').values
+    else:
+        opponents = np.array([''] * n_players)
+
+    # Game ID: canonical pair of team codes
+    game_ids = np.array([
+        f"{min(t, o)}_{max(t, o)}" if o and o != t else t
+        for t, o in zip(teams, opponents)
+    ])
+    unique_games = np.unique(game_ids)
+
     n_lineups = len(field_lineup_ids)
     scores = np.zeros((n_lineups, iterations))
     lineup_arrays = [np.array(ids) for ids in field_lineup_ids]
+
     for it in range(iterations):
+        # Team-level shocks: a team's offense as a whole
         team_shocks = {t: rng.normal(0, 1) for t in np.unique(teams)}
+        # Game-level shocks: the game environment (shootout vs defensive battle)
+        game_shocks = {g: rng.normal(0, 1) for g in unique_games}
+
         player_scores = np.zeros(n_players)
         for i in range(n_players):
             m, s = means[i], stds[i]
             pos, team = positions[i], teams[i]
+            gid = game_ids[i]
             base = rng.normal(0, 1)
+            t_shock = team_shocks[team]
+            g_shock = game_shocks[gid]
+
             if pos == 'QB':
-                z = 0.55 * base + 0.45 * team_shocks[team]
+                z = 0.45 * base + 0.35 * t_shock + 0.20 * g_shock
             elif pos in ('WR', 'TE'):
-                z = 0.65 * base + 0.35 * team_shocks[team]
+                z = 0.55 * base + 0.30 * t_shock + 0.15 * g_shock
             elif pos == 'RB':
-                z = 0.85 * base + 0.15 * team_shocks[team]
-            else:
-                z = base
+                z = 0.70 * base + 0.20 * t_shock + 0.10 * g_shock
+            else:  # DST — benefits from a low-scoring game, so the game shock is negative
+                z = 0.60 * base + 0.25 * t_shock - 0.15 * g_shock
+
             player_scores[i] = max(0.0, m + s * z)
+
         for li, arr in enumerate(lineup_arrays):
             scores[li, it] = player_scores[arr].sum()
+
     return scores
 
 
@@ -479,21 +574,63 @@ def save_lineups(proj, lineups, path):
 
 
 def load_lineups_csv(proj, path):
+    import re
     try:
         df = pd.read_csv(path)
     except pd.errors.EmptyDataError:
         return []
     if df.empty:
         return []
+
+    print(f"[Loader] Loaded {len(df)} rows")
+    print(f"[Loader] All columns: {df.columns.tolist()}")
+
     name_to_idx = dict(zip(proj['_key'], proj.index))
-    slot_cols = [c for c in df.columns if c.startswith('slot')]
+
+    # Match slot0..slot8 or QB/RB1/...
+    slot_cols = sorted([c for c in df.columns if re.match(r'^slot\d+$', c)],
+                       key=lambda c: int(c[4:]))
+    if not slot_cols:
+        candidates = ['QB', 'RB1', 'RB2', 'WR1', 'WR2', 'WR3', 'TE', 'FLEX', 'DST']
+        slot_cols = [c for c in candidates if c in df.columns]
+
+    print(f"[Loader] Using {len(slot_cols)} slot columns: {slot_cols}")
+
     lineups = []
-    for _, row in df.iterrows():
+    failed_names = []
+    for i, row in df.iterrows():
         names = [str(row[c]) for c in slot_cols]
         ids = [name_to_idx.get(norm_name(n)) for n in names]
-        if len(ids) == 9 and all(i is not None for i in ids) and len(set(ids)) == 9:
-            lineups.append(ids)
+        missing = [names[j] for j, x in enumerate(ids) if x is None]
+        if missing:
+            failed_names.extend(missing)
+            continue
+        if len(set(ids)) != 9:
+            continue
+        lineups.append(ids)
+
+    if failed_names:
+        unique_missing = sorted(set(failed_names))
+        print(f"[Loader] {len(unique_missing)} unmatched names: {unique_missing[:15]}")
+
+    print(f"[Loader] Loaded {len(lineups)}/{len(df)} valid lineups")
     return lineups
+#def load_lineups_csv(proj, path):
+#    try:
+#        df = pd.read_csv(path)
+#    except pd.errors.EmptyDataError:
+#        return []
+#    if df.empty:
+#        return []
+#    name_to_idx = dict(zip(proj['_key'], proj.index))
+#    slot_cols = [c for c in df.columns if c.startswith('slot')]
+#    lineups = []
+#    for _, row in df.iterrows():
+#        names = [str(row[c]) for c in slot_cols]
+#        ids = [name_to_idx.get(norm_name(n)) for n in names]
+#        if len(ids) == 9 and all(i is not None for i in ids) and len(set(ids)) == 9:
+#            lineups.append(ids)
+#    return lineups
 
 
 # ============================================================

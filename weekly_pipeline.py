@@ -162,7 +162,7 @@ def identify_stack_candidates(proj, games_df, top_n=6):
             team_df = proj[proj['Team'] == team]
             qbs = team_df[team_df['Position'] == 'QB'].nlargest(1, 'Fpts')
             pcs = team_df[team_df['Position'].isin(['WR', 'TE'])].nlargest(3, 'Fpts')
-            if qbs.empty or len(pcs) < 2:
+            if qbs.empty or len(pcs) < 1: #was 2, for 2 wr per team per stack
                 continue
             qb = qbs.iloc[0]
             stack_fpts = qb['Fpts'] + pcs['Fpts'].sum()
@@ -276,9 +276,13 @@ def apply_pool_filters(proj, salary_exempt=5000):
 
 
 def build_lineups(proj, stack_candidates, force_include_names, fade_names,
-                  n_lineups=20, seed=42):
-    """Build N lineups with flexible stack construction and bring-backs."""
+                  n_lineups=20, seed=None, team_total_map=None):
+    """Build N lineups with flexible stack construction and game-gated bring-backs."""
+    if seed is None:
+        seed = np.random.randint(0, 2**31)
+    print(f"[Debug] Lineup RNG seed: {seed}")
     rng = np.random.default_rng(seed)
+
     proj = proj.reset_index(drop=True).copy()
     proj['value'] = proj['Fpts'] / (proj['Salary'] / 1000)
 
@@ -319,7 +323,6 @@ def build_lineups(proj, stack_candidates, force_include_names, fade_names,
     dst_pool = pool('DST')
     flex_pool = pd.concat([rb_pool, wr_pool, te_pool]).sort_values('value', ascending=False)
 
-    # Bring-back pools per opponent team
     def bring_back_pool(opp_team):
         return proj[
             (proj['Team'] == opp_team) &
@@ -336,10 +339,8 @@ def build_lineups(proj, stack_candidates, force_include_names, fade_names,
     used_stacks = Counter()
     stack_teams = list(stack_options.keys())
     target_per_stack = max(3, int(np.ceil(n_lineups / len(stack_teams))))
-
     attempts = 0
     max_attempts = n_lineups * 1000
-    #bring_back_count = 0
 
     while len(lineups) < n_lineups and attempts < max_attempts:
         attempts += 1
@@ -370,7 +371,7 @@ def build_lineups(proj, stack_candidates, force_include_names, fade_names,
             elif fpos == 'DST' and slots['DST'] is None:
                 slots['DST'] = fp; used_ids.add(fp)
 
-        # ---- STACK: 1-3 pass-catchers with weighted probabilities ----
+        # ---- STACK: 1-3 pass-catchers ----
         # 1 PC: 35% | 2 PCs: 55% | 3 PCs: 10%
         roll = rng.random()
         if roll < 0.35:
@@ -395,37 +396,37 @@ def build_lineups(proj, stack_candidates, force_include_names, fade_names,
                         if slots[s] is None:
                             slots[s] = pc; used_ids.add(pc); break
 
-        # ---- BRING-BACK: opposing team player at 55% frequency ----
-        do_bring_back = rng.random() < 0.55
+        # ---- BRING-BACK: game-total-gated ----
+        do_bring_back = False
+        if team_total_map is not None:
+            game_total = team_total_map.get(stack_team, 0)
+            if game_total >= 46.0:
+                do_bring_back = rng.random() < 0.75 #was .50 but was below the bring back threshold
+        else:
+            do_bring_back = rng.random() < 0.50
+
         if do_bring_back:
             bb_pool = bring_back_pool(opp_team)
             bb_pool = bb_pool[~bb_pool.index.isin(used_ids)]
             if not bb_pool.empty:
-                # Prefer the FLEX slot; otherwise put them in their natural position slot
                 bb_pick = int(rng.choice(bb_pool.head(20).index.values))
                 bb_pos = proj.loc[bb_pick, 'Position']
-                placed = False
-                if slots['FLEX'] is None:
-                    slots['FLEX'] = bb_pick
-                    used_ids.add(bb_pick)
-                    placed = True
-                    #bring_back_count += 1
-                elif bb_pos == 'WR':
+                # Prefer position-matched slots. Do NOT dump into FLEX.
+                if bb_pos == 'WR':
                     for s in ['WR1', 'WR2', 'WR3']:
                         if slots[s] is None:
-                            slots[s] = bb_pick; used_ids.add(bb_pick); placed = True
-                            #bring_back_count += 1
+                            slots[s] = bb_pick
+                            used_ids.add(bb_pick)
                             break
                 elif bb_pos == 'TE' and slots['TE'] is None:
-                    slots['TE'] = bb_pick; used_ids.add(bb_pick); placed = True
-                    #bring_back_count += 1
+                    slots['TE'] = bb_pick
+                    used_ids.add(bb_pick)
                 elif bb_pos == 'RB':
                     for s in ['RB1', 'RB2']:
                         if slots[s] is None:
-                            slots[s] = bb_pick; used_ids.add(bb_pick); placed = True
-                            #bring_back_count += 1
+                            slots[s] = bb_pick
+                            used_ids.add(bb_pick)
                             break
-                # If no slot fits, skip the bring-back for this lineup
 
         # ---- Fill remaining slots ----
         for s in ['RB1', 'RB2']:
@@ -445,8 +446,21 @@ def build_lineups(proj, stack_candidates, force_include_names, fade_names,
             if pick is not None:
                 slots['TE'] = pick; used_ids.add(pick)
 
+        # ---- FLEX: weighted preference RB 55%, WR 40%, TE 5% ----
         if slots['FLEX'] is None:
-            pick = pick_from(flex_pool, used_ids, top_n=40)
+            flex_roll = rng.random()
+            if flex_roll < 0.55:
+                candidate_pool = rb_pool
+            elif flex_roll < 0.95:
+                candidate_pool = wr_pool
+            else:
+                candidate_pool = te_pool
+
+            pick = pick_from(candidate_pool, used_ids, top_n=20)
+            if pick is None:
+                pick = pick_from(candidate_pool, used_ids, top_n=50)
+            if pick is None:
+                pick = pick_from(flex_pool, used_ids, top_n=40)
             if pick is not None:
                 slots['FLEX'] = pick; used_ids.add(pick)
 
@@ -486,21 +500,39 @@ def build_lineups(proj, stack_candidates, force_include_names, fade_names,
 
     print(f"\nBuilt {len(lineups)} lineups in {attempts} attempts")
     print(f"Stack distribution: {dict(used_stacks)}")
-    #print(f"Bring-backs included: {bring_back_count} ({100*bring_back_count/max(len(lineups),1):.0f}% of lineups)")
-    # Count bring-backs in the final validated lineups
+
+    # ---- Bring-back reporting ----
     final_bb_count = 0
+    bb_high_total = 0
     for slots in lineups:
         stack_team_name = proj.loc[slots['QB'], 'Team']
         opp_team_name = stack_options[stack_team_name]['opp_team']
+        game_total = team_total_map.get(stack_team_name, 0) if team_total_map else 0
+        has_bb = False
         for slot_name in ['FLEX', 'RB1', 'RB2', 'WR1', 'WR2', 'WR3', 'TE']:
             player_id = slots.get(slot_name)
             if player_id is not None and proj.loc[player_id, 'Team'] == opp_team_name:
-                final_bb_count += 1
+                has_bb = True
                 break
+        if has_bb:
+            final_bb_count += 1
+            if game_total >= 46.0:
+                bb_high_total += 1
 
-    print(f"Bring-backs in final lineups: {final_bb_count} ({100*final_bb_count/max(len(lineups),1):.0f}% of lineups)")
+    print(f"Bring-backs in final lineups: {final_bb_count} ({100*final_bb_count/max(len(lineups),1):.0f}%)")
+    print(f"  Of those, {bb_high_total} in games with total >= 46")
+
+    # ---- FLEX position reporting ----
+    flex_positions = []
+    for slots in lineups:
+        flex_id = slots.get('FLEX')
+        if flex_id is not None:
+            flex_positions.append(proj.loc[flex_id, 'Position'])
+    if flex_positions:
+        from collections import Counter as _C
+        print(f"FLEX position distribution: {dict(_C(flex_positions))}")
+
     return lineups, proj
-
 
 def lineups_to_df(proj, lineups):
     rows = []
@@ -595,9 +627,62 @@ def main():
 
     # Step 7: Stack candidates
     stack_candidates = identify_stack_candidates(proj, games_df, top_n=8)
+        # Load manual stacks and append to auto-detected candidates
+    if os.path.exists('manual_stacks.csv'):
+        manual = pd.read_csv('manual_stacks.csv')
+        existing_teams = set(stack_candidates['team'].tolist()) if not stack_candidates.empty else set()
+        added_count = 0
+        for _, mrow in manual.iterrows():
+            team = mrow['team']
+            if team in existing_teams:
+                print(f"[ManualStack] {team} already in auto candidates — skipping")
+                continue
+            team_df = proj[proj['Team'] == team]
+            qbs = team_df[team_df['Position'] == 'QB'].nlargest(1, 'Fpts')
+            pcs = team_df[team_df['Position'].isin(['WR', 'TE'])].nlargest(3, 'Fpts')
+            if qbs.empty or len(pcs) < 1:
+                print(f"[ManualStack] Skipping {team} — insufficient pool")
+                continue
+            qb = qbs.iloc[0]
+            stack_fpts = qb['Fpts'] + pcs['Fpts'].sum()
+            game_row = games_df[(games_df['home'] == team) | (games_df['away'] == team)]
+            if game_row.empty:
+                print(f"[ManualStack] Skipping {team} — no game row")
+                continue
+            g = game_row.iloc[0]
+            implied = g['home_implied'] if g['home'] == team else g['away_implied']
+            opp = g['away'] if g['home'] == team else g['home']
+            score = 0.5 * stack_fpts + 0.5 * (implied * 2.5)
+            stack_candidates = pd.concat([stack_candidates, pd.DataFrame([{
+                'team': team, 'opp': opp, 'matchup': g['matchup'],
+                'game_total': g['total'], 'team_implied': implied,
+                'qb_name': qb['Name'], 'qb_fpts': round(qb['Fpts'], 2),
+                'pc_names': pcs['Name'].tolist(), 'pc_fpts': round(pcs['Fpts'].sum(), 2),
+                'stack_fpts': round(stack_fpts, 2), 'score': round(score, 2),
+            }])], ignore_index=True)
+            print(f"[ManualStack] Added {team} stack (QB={qb['Name']}, opp={opp}, score={score:.2f})")
+            added_count += 1
+        if added_count > 0:
+            print(f"[ManualStack] Total manual stacks added: {added_count}")
+            # Print the combined stack candidates table
+            print("\n" + "=" * 95)
+            print("COMBINED STACK CANDIDATES (auto + manual)")
+            print("=" * 95)
+            print(f"{'Team':<5} {'Opp':<5} {'Game':>6} {'Impl':>6} {'QB+PC':>7} {'Score':>7}  Stack")
+            for _, r in stack_candidates.sort_values('score', ascending=False).iterrows():
+                print(f"{r['team']:<5} {r['opp']:<5} {r['game_total']:>6.1f} {r['team_implied']:>6.1f} "
+                      f"{r['stack_fpts']:>7.2f} {r['score']:>7.2f}  "
+                      f"{r['qb_name']} + {', '.join(r['pc_names'][:2])}")
+                
     if stack_candidates.empty:
         print("[ERROR] No stack candidates found.")
         return
+
+    # Build team -> game total map for bring-back gating
+    team_total_map = {}
+    for _, g in games_df.iterrows():
+        team_total_map[g['home']] = g['total']
+        team_total_map[g['away']] = g['total']
 
     # Step 8: Build lineups
     print("\n" + "=" * 95)
@@ -608,6 +693,7 @@ def main():
         force_include_names=force_include,
         fade_names=set(),  # already applied
         n_lineups=args.n_lineups,
+        team_total_map=team_total_map,
     )
     if not lineups:
         print("[ERROR] No lineups built.")
